@@ -3114,7 +3114,30 @@ Body: ${(bodyPreview || '').substring(0, 500)}`;
     // 0a. Passive fact extraction — learn structured facts from every message (no LLM, regex only)
     if (memoryExtractService) {
       const learned = memoryExtractService.extractAndSave(message);
-      if (learned > 0) console.log(`[MemoryExtract] Learned ${learned} new fact(s)`);
+      if (learned > 0) {
+        console.log(`[MemoryExtract] Learned ${learned} new fact(s)`);
+
+        // ── TIER-0e: Fact-declaration fast-ack ──────────────────────────────────
+        // If the message IS a pure fact declaration (no question, no action verb,
+        // no question words) AND we successfully extracted facts from it,
+        // acknowledge instantly — do NOT send a full Ollama call just to say "Got it".
+        const _trim = message.trim();
+        const _hasQuestion = /[?]/.test(_trim) || /^(what|where|when|who|how|why|can|could|would|should|is|are|do|does|did)\b/i.test(_trim);
+        const _hasActionVerb = /^(remind|add|create|delete|send|reply|book|schedule|set\s+a|draft|find|search|show|list|get|check)\b/i.test(_trim);
+        if (!_hasQuestion && !_hasActionVerb && _trim.length <= 120) {
+          console.log(`[AI] TIER-0e fast-ack — fact stored, skipping LLM`);
+          const _acks = ['Noted.', 'Got it, I\'ll remember that.', 'Saved to memory.', 'Remembered.'];
+          const _ack = _acks[Math.floor(Date.now() / 1000) % _acks.length];
+          const ackResult = {
+            text: _ack,
+            followUps: ['What do you know about me?', 'Update my profile'],
+            mode: mode || 'work',
+            aiProvider: 'fast-ack'
+          };
+          try { run(`INSERT INTO chat_messages (role, text, created_at) VALUES (?, ?, ?)`, ['assistant', _ack, nowUnix()]); } catch (_) {}
+          return ackResult;
+        }
+      }
     }
 
     // 0b. P10-4: Context Memory — extract entities and link to context threads
@@ -3182,8 +3205,48 @@ Body: ${(bodyPreview || '').substring(0, 500)}`;
       if (nlQueryService && nlQueryService.isDataQuery(message)) {
         const queryResult = nlQueryService.processQuery(message);
         if (queryResult.answer) {
-          console.log(`[AI] TIER-1 fast-path (data-query) — skipped LLM entirely`);
           const followUps = _getFollowUps(queryResult.type, message);
+
+          // ── Email summary: nl-query returned previews + needsSummary flag ──
+          // Fire ONE targeted Ollama call to turn raw previews into a digest.
+          // Falls back to the plain preview list if aiService is unavailable.
+          if (queryResult.data?.needsSummary && aiService) {
+            console.log(`[AI] TIER-1 email summary: sending ${queryResult.data.limit} email previews to LLM`);
+            let aiSummary = '';
+            try {
+              aiSummary = await aiService.aiCall(
+                'chat',
+                queryResult.data.summaryPrompt,
+                {
+                  systemContext:
+                    'You are summarizing emails for a busy professional. ' +
+                    'For each email give ONE bullet line: sender, subject, and what action (if any) is needed. ' +
+                    'Be extremely concise. No preamble. Format: • Sender: "Subject" — action/gist.'
+                }
+              );
+              aiSummary = (typeof aiSummary === 'string' ? aiSummary : aiSummary?.text || '').trim();
+            } catch (_) { /* fallback to plain list below */ }
+
+            const summaryText = aiSummary
+              ? `📧 **Email digest — last ${queryResult.data.limit}:**\n\n${aiSummary}`
+              : `📧 ${queryResult.answer}`;
+
+            const summaryResult = {
+              text: summaryText,
+              action: 'query_answered',
+              queryType: 'email',
+              data: queryResult.data,
+              followUps: ['Any urgent emails?', 'Show unread', 'Refresh inbox'],
+              mode: mode || 'work',
+              aiProvider: 'local-query+llm-summary'
+            };
+            // Cache for 10 min (emails don't change that fast)
+            if (responseCacheService) responseCacheService.set(message, summaryResult, 600);
+            if (memoryExtractService) memoryExtractService.saveAnswer(message, summaryResult.text, 'email-summary', 600);
+            return summaryResult;
+          }
+
+          console.log(`[AI] TIER-1 fast-path (data-query) — skipped LLM entirely`);
           const result = {
             text: `📊 ${queryResult.answer}`,
             action: 'query_answered',

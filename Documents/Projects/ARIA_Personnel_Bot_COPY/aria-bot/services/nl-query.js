@@ -1030,6 +1030,41 @@ function handleEmail(intent) {
     }
   }
 
+  // ── "summarize/list last N emails" — return previews + flag for targeted AI summary ──
+  // Triggered by action='summary' or action='list' (both land here after falling through
+  // the specific sub-patterns above).  main.js sees needsSummary=true and fires one short
+  // Ollama call to turn the previews into a digest — result cached for 10 min.
+  if (action === 'summary' || action === 'list') {
+    const lim = params.limit || 5;
+    const emails = all(
+      `SELECT from_name, from_email, subject, body_preview, category, received_at
+       FROM email_cache ORDER BY received_at DESC LIMIT ?`,
+      [lim]
+    );
+    if (emails.length === 0) {
+      return { answer: 'No emails cached yet. Try refreshing your inbox first.', type: 'email' };
+    }
+
+    // Structured preview list shown immediately (before AI summary is generated)
+    let lines = [`**Last ${emails.length} email${emails.length > 1 ? 's' : ''}:**\n`];
+    for (const e of emails) {
+      const flag = e.category === 'urgent' ? '🔴 ' : e.category === 'action' ? '🟡 ' : '';
+      const preview = e.body_preview ? ` — ${e.body_preview.substring(0, 90).trim()}...` : '';
+      lines.push(`• ${flag}**${e.from_name || e.from_email || 'Unknown'}**: "${e.subject}"${preview}`);
+    }
+
+    // summaryPrompt passed to main.js for a single targeted Ollama call
+    const summaryPrompt = emails.map(e =>
+      `From: ${e.from_name || e.from_email}\nSubject: ${e.subject}\nPreview: ${(e.body_preview || 'No preview').substring(0, 300)}`
+    ).join('\n---\n');
+
+    return {
+      answer: lines.join('\n'),
+      type: 'email',
+      data: { emails, needsSummary: true, summaryPrompt, limit: lim }
+    };
+  }
+
   // Default: email overview
   const total = get(`SELECT COUNT(*) as cnt FROM email_cache`)?.cnt || 0;
   const unreadCnt = get(`SELECT COUNT(*) as cnt FROM email_cache WHERE is_read = 0`)?.cnt || 0;
