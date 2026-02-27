@@ -24,6 +24,7 @@ const intelligence = require(path.join(__dirname, 'intelligence'));
 // getCategories() returns array of all known category names
 // resolveCategory(input) maps synonyms: "dining" → "food", "commute" → "travel"
 const { getMerchants, getCategories, resolveCategory, CATEGORY_SYNONYMS } = intelligence;
+const { enrichResult } = require(path.join(__dirname, 'analysis-engine'));
 
 const MONTHS = {
   jan: 0, january: 0, feb: 1, february: 1, mar: 2, march: 2,
@@ -470,7 +471,7 @@ function processQuery(msg, externalParams) {
   try {
     switch (intent.domain) {
       case 'money':
-        return handleMoney(intent);
+        return enrichResult(handleMoney(intent), intent);
       case 'subscriptions':
         return handleSubscriptions(intent);
       case 'email':

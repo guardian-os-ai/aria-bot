@@ -3068,6 +3068,18 @@ Body: ${(bodyPreview || '').substring(0, 500)}`;
     }
   }
 
+  // ── Conversation context threading — tracks last money query for follow-up resolution ──
+  // Example: user asks "food this month" → then "why is it high?" — the second
+  // query inherits category='food' so nl-query doesn't need to re-extract it.
+  // RESETS when the app restarts (in-memory only — stale context is worse than no context).
+  const _chatSession = {
+    lastDomain:    null,   // 'money', 'email', etc.
+    lastCategory:  null,   // e.g. 'food', 'travel'
+    lastMerchant:  null,   // e.g. 'swiggy', 'uber'
+    lastQuery:     null,   // original message text
+    lastQueryTime: 0,      // Date.now() ms for 5-min follow-up window
+  };
+
   async function chatEnhancedHandler(message, mode) {
     // ── FAST PATH: greetings & trivial messages — instant response, no LLM ──
     const GREETING_RE = /^(hi|hey|hello|yo|sup|hiya|howdy|morning|good morning|good afternoon|good evening|gm|whats up|what's up|hii+|helo|namaste|ola)[\s!?.]*$/i;
@@ -3203,7 +3215,12 @@ Body: ${(bodyPreview || '').substring(0, 500)}`;
       }
 
       if (nlQueryService && nlQueryService.isDataQuery(message)) {
-        const queryResult = nlQueryService.processQuery(message);
+        // Inject session context for follow-up queries — fills category/merchant only if
+        // nl-query didn't extract them itself, and only when session is < 5 min old.
+        const sessionCtx = (_chatSession.lastQueryTime && Date.now() - _chatSession.lastQueryTime < 300000)
+          ? { category: _chatSession.lastCategory, merchant: _chatSession.lastMerchant }
+          : undefined;
+        const queryResult = nlQueryService.processQuery(message, sessionCtx);
         if (queryResult.answer) {
           const followUps = _getFollowUps(queryResult.type, message);
 
@@ -3256,6 +3273,16 @@ Body: ${(bodyPreview || '').substring(0, 500)}`;
             mode: mode || 'work',
             aiProvider: 'local-query'
           };
+          // Update conversation context so follow-up queries can inherit category/merchant
+          if (queryResult.type === 'money') {
+            _chatSession.lastDomain    = 'money';
+            _chatSession.lastCategory  = queryResult.data?.category || null;
+            _chatSession.lastMerchant  = queryResult.data?.merchants?.[0]?.name?.toLowerCase()
+                                          || queryResult.data?.merchant
+                                          || null;
+            _chatSession.lastQuery     = message;
+            _chatSession.lastQueryTime = Date.now();
+          }
           // Cache data query answers for 5 min (they're time-relative, e.g. "this week")
           if (responseCacheService) responseCacheService.set(message, result, 300);
           // Persist in query_answers (TTL 1hr — data changes but not every minute)
