@@ -560,6 +560,25 @@ TOOLS = [
                 "required": []
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_automation_rule",
+            "description": "Create a trigger-action automation rule (like Zapier, but local). Use when user says 'alert me when', 'notify me if', 'remind me when X happens', 'create a rule for'. Examples: 'alert me when Swiggy spend > 2000 this week', 'notify when I have an overdue task', 'flag emails from boss@company.com'. Converts natural-language rules into persistent automation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Human-readable rule name (e.g. 'Swiggy weekly limit alert')"},
+                    "trigger_type": {"type": "string", "description": "Trigger type: spend_over (total/category exceeds threshold), category_spike (unusual spike vs avg), email_from (email arrives from sender), subscription_renewing (sub renews within N days), reminder_overdue (task past due), habit_streak_broken (habit not logged today)"},
+                    "trigger_params": {"type": "string", "description": "JSON string of trigger parameters. spend_over: {category, threshold, period_days}. category_spike: {category, deviation_percent}. email_from: {sender_pattern, hours_window}. subscription_renewing: {days_ahead}. reminder_overdue: {hours_past_due}. habit_streak_broken: {habit_name}."},
+                    "action_type": {"type": "string", "description": "Action type: notify (push notification to user), create_reminder (create a task), flag_email (mark email important)"},
+                    "action_params": {"type": "string", "description": "JSON string of action parameters. notify: {message}. create_reminder: {title, priority}. flag_email: {label}."},
+                    "cooldown_mins": {"type": "integer", "description": "Minutes between repeat firings to prevent spam (default 60, use 1440 for once-daily)"}
+                },
+                "required": ["name", "trigger_type", "trigger_params", "action_type", "action_params"]
+            }
+        }
     }
 ]
 
@@ -710,6 +729,65 @@ def _get_spending_analysis(category: Optional[str] = None, days: int = 30,
         return {"error": str(e)}
 
 
+def _create_automation_rule(name: str, trigger_type: str, trigger_params: str,
+                             action_type: str, action_params: str,
+                             cooldown_mins: int = 60, db_path: str = "") -> Dict[str, Any]:
+    """
+    Create a new automation rule in the automation_rules table.
+    Called by the agent when the user requests a natural-language rule like
+    'alert me when Swiggy spend > 2000 this week' or 'flag emails from boss'.
+    trigger_params and action_params arrive as JSON strings from Ollama.
+    """
+    if not db_path:
+        db_path = _get_db_path()
+
+    # Parse JSON params — Ollama may send either a string or an already-parsed dict
+    def _parse_json(val):
+        if isinstance(val, dict):
+            return val
+        try:
+            return json.loads(val) if val else {}
+        except Exception:
+            return {}
+
+    tp = _parse_json(trigger_params)
+    ap = _parse_json(action_params)
+
+    VALID_TRIGGERS = {'spend_over', 'category_spike', 'email_from',
+                      'subscription_renewing', 'reminder_overdue', 'habit_streak_broken'}
+    VALID_ACTIONS  = {'notify', 'create_reminder', 'flag_email'}
+
+    if trigger_type not in VALID_TRIGGERS:
+        return {"error": f"Unknown trigger_type '{trigger_type}'. Valid: {', '.join(VALID_TRIGGERS)}"}
+    if action_type not in VALID_ACTIONS:
+        return {"error": f"Unknown action_type '{action_type}'. Valid: {', '.join(VALID_ACTIONS)}"}
+
+    try:
+        conn = sqlite3.connect(db_path, timeout=5)
+        now_ts = int(datetime.datetime.now().timestamp())
+        conn.execute(
+            """INSERT INTO automation_rules
+               (name, trigger_type, trigger_params, action_type, action_params,
+                cooldown_mins, enabled, fire_count, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?)""",
+            (name, trigger_type, json.dumps(tp), action_type, json.dumps(ap),
+             cooldown_mins, now_ts)
+        )
+        conn.commit()
+        rule_id = conn.execute("SELECT last_insert_rowid() as id").fetchone()["id"]
+        conn.close()
+        return {
+            "success": True,
+            "rule_id": rule_id,
+            "name": name,
+            "trigger_type": trigger_type,
+            "action_type": action_type,
+            "message": f"Automation rule '{name}' created (ID {rule_id}). It will start evaluating on the next background sync (every 5 minutes)."
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # ── Tool Execution ────────────────────────────────────────────────────────────
 
 # Isolated thread pool — tool calls run here so they can be timed out
@@ -776,6 +854,17 @@ def _execute_tool_inner(name: str, arguments: Dict[str, Any],
         elif name == "get_priorities":
             result = _get_priorities_tool(
                 limit=int(arguments.get("limit", 8)),
+                db_path=db_path,
+            )
+
+        elif name == "create_automation_rule":
+            result = _create_automation_rule(
+                name=arguments.get("name", "Unnamed Rule"),
+                trigger_type=arguments.get("trigger_type", "spend_over"),
+                trigger_params=arguments.get("trigger_params", "{}"),
+                action_type=arguments.get("action_type", "notify"),
+                action_params=arguments.get("action_params", "{}"),
+                cooldown_mins=int(arguments.get("cooldown_mins", 60)),
                 db_path=db_path,
             )
 

@@ -292,6 +292,45 @@ function extractMerchant(fromName, fromEmail, subject) {
  * @param {{ message_id, from_name, from_email, subject, body_preview, received_at }} email
  * @returns {{ merchant, category, amount, currency, description, timestamp, source_email_id } | null}
  */
+
+// ── Payment method extractor ──
+// Detects card/bank/UPI used for the transaction from subject/body text.
+// Returns canonical name: "HDFC CC", "ICICI Debit", "UPI", "Axis CC", etc.
+// Returns null if not detectable — user can later tag manually.
+function extractPaymentMethod(subject, bodyPreview) {
+  const text = `${subject || ''} ${bodyPreview || ''}`.toLowerCase();
+
+  // Bank + card type patterns (order: most specific first)
+  const CARD_PATTERNS = [
+    [/hdfc.*credit\s*card|credit\s*card.*hdfc/i,    'HDFC CC'],
+    [/hdfc.*debit|debit.*hdfc/i,                    'HDFC Debit'],
+    [/icici.*credit\s*card|credit\s*card.*icici/i,  'ICICI CC'],
+    [/icici.*debit|debit.*icici/i,                  'ICICI Debit'],
+    [/sbi.*credit\s*card|credit\s*card.*sbi/i,      'SBI CC'],
+    [/sbi.*debit|debit.*sbi/i,                      'SBI Debit'],
+    [/axis.*credit\s*card|credit\s*card.*axis/i,    'Axis CC'],
+    [/axis.*debit|debit.*axis/i,                    'Axis Debit'],
+    [/kotak.*credit\s*card|credit\s*card.*kotak/i,  'Kotak CC'],
+    [/kotak.*debit|debit.*kotak/i,                  'Kotak Debit'],
+    [/amex|american\s*express/i,                    'Amex CC'],
+    [/citi.*credit|credit.*citi/i,                  'Citi CC'],
+    [/rbl.*credit|credit.*rbl/i,                    'RBL CC'],
+    [/indusind.*credit|credit.*indusind/i,          'IndusInd CC'],
+    [/yes\s*bank.*credit|credit.*yes\s*bank/i,      'Yes Bank CC'],
+    // Generic UPI / wallets
+    [/\bupi\b|phonepe|gpay|google\s*pay|paytm|bhim/i, 'UPI'],
+    [/\bcash\b|cash\s+on\s+delivery|cod\b/i,        'Cash'],
+    // Generic fallback for any bank debit alert
+    [/\bhdfc\b/i, 'HDFC'], [/\bicici\b/i, 'ICICI'], [/\bsbi\b/i, 'SBI'],
+    [/\baxis\b/i, 'Axis'], [/\bkotak\b/i, 'Kotak'],
+  ];
+
+  for (const [re, label] of CARD_PATTERNS) {
+    if (re.test(text)) return label;
+  }
+  return null;
+}
+
 function extractTransaction(email) {
   const { message_id, from_name, from_email, subject, body_preview, received_at } = email;
 
@@ -304,11 +343,12 @@ function extractTransaction(email) {
   // Skip zero-value signals (marketing, info-only)
   if (amount <= 0) return null;
 
-  const merchant     = extractMerchant(from_name, from_email, subject);
-  const category     = merchantToCategory(searchText);
-  const timestamp    = received_at || Math.floor(Date.now() / 1000);
-  const tx_type      = detectTxType(subject, body_preview);
-  const payment_link = extractPaymentLink(body_preview);
+  const merchant      = extractMerchant(from_name, from_email, subject);
+  const category      = merchantToCategory(searchText);
+  const timestamp     = received_at || Math.floor(Date.now() / 1000);
+  const tx_type       = detectTxType(subject, body_preview);
+  const payment_link  = extractPaymentLink(body_preview);
+  const payment_method = extractPaymentMethod(subject, body_preview);
 
   return {
     merchant,
@@ -320,6 +360,7 @@ function extractTransaction(email) {
     source_email_id: message_id || null,
     tx_type,
     payment_link,
+    payment_method,
   };
 }
 
@@ -531,9 +572,9 @@ function persistTransactions(db, lookbackDays = 90) {
     try {
       db.run(
         `INSERT OR IGNORE INTO transactions
-           (merchant, category, amount, currency, description, timestamp, source_email_id, tx_type, payment_link)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [tx.merchant, tx.category, tx.amount, tx.currency, tx.description, tx.timestamp, tx.source_email_id, tx.tx_type || 'debit', tx.payment_link || null]
+           (merchant, category, amount, currency, description, timestamp, source_email_id, tx_type, payment_link, payment_method)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [tx.merchant, tx.category, tx.amount, tx.currency, tx.description, tx.timestamp, tx.source_email_id, tx.tx_type || 'debit', tx.payment_link || null, tx.payment_method || null]
       );
       db.run(
         `INSERT OR IGNORE INTO spend_log (category, amount_raw, description, source, source_ref, occurred_at)

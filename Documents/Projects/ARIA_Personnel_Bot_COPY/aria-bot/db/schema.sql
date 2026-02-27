@@ -153,6 +153,9 @@ CREATE TABLE IF NOT EXISTS transactions (
   description     TEXT,                              -- subject line / short context
   timestamp       INTEGER NOT NULL,                  -- unix epoch of the transaction
   source_email_id TEXT,                              -- email message_id (for dedup / tracing)
+  tx_type         TEXT DEFAULT 'debit',              -- debit|credit
+  payment_link    TEXT,                              -- payment URL if any
+  payment_method  TEXT,                              -- HDFC/ICICI/SBI/Axis/UPI/Cash etc. — enables 'which card for fuel'
   created_at      INTEGER DEFAULT (strftime('%s','now'))
 );
 CREATE INDEX IF NOT EXISTS idx_tx_timestamp  ON transactions(timestamp);

@@ -50,8 +50,11 @@ function extractQueryIntent(msg) {
     action: null,     // list | summary | total | compare | last | count | search | breakdown | trend
     params: {
       merchant: null,
-      merchants: [],   // ALL matched merchants — enables Swiggy vs Zomato comparisons
+      merchants: [],   // ALL matched merchants — "uber vs rapido", "swiggy or zomato" — dynamic from DB
       category: null,
+      categories: [],  // ALL matched categories — enables "food vs travel" comparison — dynamic from DB
+      cardQuery: false, // "which card for fuel" → GROUP BY payment_method
+      multiPeriod: null, // "compare last 3 months" → [{start,end,label}...] per-period breakdown
       timeRange: null,  // { start, end } unix timestamps
       limit: null,
       comparison: false,
@@ -60,16 +63,19 @@ function extractQueryIntent(msg) {
     }
   };
 
-  // ── Extract merchant (DYNAMIC: loaded from DB + base list, cached 5 min) ──
-  // Check longest match first (e.g. "google pay" before "google")
-  const knownMerchants = getMerchants(); // dynamic, sorted longest-first
+  // Dynamic merchant extraction — loaded from DB + base list, sorted longest-first.
+  // NO hardcoding. Any merchant in transactions DB is auto-detected.
+  // "uber vs rapido", "swiggy or zomato" — merchants[] collects ALL matches.
+  const knownMerchants = getMerchants();
   for (const m of knownMerchants) {
     const mRegex = new RegExp(`\\b${m.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
     if (mRegex.test(low)) {
-      result.params.merchant = m;
-      break;
+      if (!result.params.merchant) result.params.merchant = m; // primary = longest/first
+      if (!result.params.merchants.includes(m)) result.params.merchants.push(m);
     }
   }
+  // 2+ merchants found → auto-enable comparison. Zero hardcoding.
+  if (result.params.merchants.length >= 2) result.params.comparison = true;
 
   // ── Extract category (DYNAMIC: with synonym resolution) ──
   // "spend on food" / "dining expenses" / "commute costs" → resolved via synonyms
@@ -114,6 +120,35 @@ function extractQueryIntent(msg) {
     }
   }
 
+  // ── Multi-category extraction ("food vs travel", "compare shopping and entertainment") ──
+  // Works for ANY categories stored in DB. Zero hardcoding — new categories auto-detected.
+  for (const cat of knownCategories) {
+    const catRegex = new RegExp(`\\b${cat}\\b`, 'i');
+    if (catRegex.test(low)) {
+      if (!result.params.categories.includes(cat)) result.params.categories.push(cat);
+    }
+  }
+  for (const syn of allSynonymKeys) {
+    const synRegex = new RegExp(`\\b${syn.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}\\b`, 'i');
+    if (synRegex.test(low)) {
+      const resolved = CATEGORY_SYNONYMS[syn];
+      if (resolved && !result.params.categories.includes(resolved)) {
+        result.params.categories.push(resolved);
+      }
+    }
+  }
+  if (result.params.categories.length >= 2) {
+    result.params.comparison = true;
+    if (!result.params.category) result.params.category = result.params.categories[0];
+  }
+
+  // ── Card/payment method query detection ──
+  // "which card", "what card", "on hdfc", "axis credit card spend"
+  // Covers named banks (hdfc/icici/sbi/axis) and generic "which card" phrasing
+  if (/which\s+card|what\s+card|on\s+which\s+card|card.*(?:use|pay|spent|spend)|(?:paid|pay).*card|\bhdfc\b|\bicici\b|\bsbi\b|\baxis\b|\bkotak\b|\bamex\b|\bciti\b|\brbl\b|\bindus(?:ind)?\b/.test(low)) {
+    result.params.cardQuery = true;
+  }
+
   // ── Extract time range ──
   result.params.timeRange = parseTimeRange(low);
 
@@ -137,6 +172,42 @@ function extractQueryIntent(msg) {
   // ── Detect comparison intent ──
   if (/\bcompar|vs\.?\b|\bversus\b|\bagainst\b|than\s+last|to\s+last|month\s+over\s+month|week\s+over\s+week/.test(low)) {
     result.params.comparison = true;
+  }
+
+  // ── Multi-period breakdown: "compare last 3 months" / "last 6 months food trend" ──
+  // comparison=true + last N months/weeks → per-period [{start,end,label}] array
+  // NOT a single flattened range — each period rendered separately with delta.
+  const multiPeriodMatch = low.match(/\blast\s+(\d+)\s+(month|week)s?\b/);
+  if (multiPeriodMatch && result.params.comparison) {
+    const n = parseInt(multiPeriodMatch[1], 10);
+    const unit = multiPeriodMatch[2];
+    if (n >= 2 && n <= 12) {
+      const periods = [];
+      const nowDate = new Date();
+      for (let i = n - 1; i >= 0; i--) {
+        let pStart, pEnd;
+        if (unit === 'month') {
+          pStart = new Date(nowDate.getFullYear(), nowDate.getMonth() - i, 1);
+          pEnd   = new Date(nowDate.getFullYear(), nowDate.getMonth() - i + 1, 0, 23, 59, 59, 999);
+        } else {
+          const refMon = new Date(nowDate);
+          const dow = refMon.getDay();
+          refMon.setDate(refMon.getDate() - (dow === 0 ? 6 : dow - 1) - i * 7);
+          refMon.setHours(0, 0, 0, 0);
+          pStart = new Date(refMon);
+          pEnd   = new Date(refMon.getTime() + 6 * 86400000 + 86399999);
+        }
+        const label = unit === 'month'
+          ? pStart.toLocaleString('default', { month: 'short', year: '2-digit' })
+          : `W-${i === 0 ? 'now' : i} ${pStart.toLocaleString('default', { month: 'short' })}`;
+        periods.push({
+          start: Math.floor(pStart.getTime() / 1000),
+          end:   Math.floor(pEnd.getTime()   / 1000),
+          label
+        });
+      }
+      result.params.multiPeriod = periods;
+    }
   }
 
   // ── Determine domain ──
@@ -438,7 +509,27 @@ function handleMoney(intent) {
   const { merchant, category, limit, comparison } = params;
   const tr = params.timeRange || defaultTimeRange();
 
-  // ── Multi-merchant comparison: "swiggy vs zomato", "am I spending more on X or Y" ──
+  // ── Multi-period breakdown: "compare last 3 months", "food last 6 months" ──
+  // Triggered when comparison intent + "last N months/weeks" detected.
+  // Each period rendered separately — NOT a flat range sum.
+  if (params.multiPeriod && params.multiPeriod.length >= 2) {
+    return handleMultiPeriodBreakdown(category, merchant, params.multiPeriod);
+  }
+
+  // ── Multi-category comparison: "food vs travel", "compare shopping vs entertainment" ──
+  // Dynamic: categories[] built from DB, NOT from any hardcoded list.
+  if (params.categories && params.categories.length >= 2) {
+    return handleCategoryComparison(params.categories, tr);
+  }
+
+  // ── Card-level analysis: "which card did I use for fuel", "HDFC vs ICICI spend" ──
+  // Groups by payment_method column in transactions table.
+  if (params.cardQuery) {
+    return handleCardAnalysis(category, tr);
+  }
+
+  // ── Multi-merchant comparison: "uber vs rapido", "swiggy or zomato" ──
+  // Dynamic: merchants[] built from DB — any pair the user asks about. Zero hardcoding.
   if (params.merchants && params.merchants.length >= 2) {
     return handleMerchantComparison(params.merchants, tr);
   }
@@ -510,6 +601,148 @@ function handleMerchantComparison(merchants, tr) {
   }
 
   return { answer: lines.join('\n'), type: 'money', data: { merchants: results, period } };
+}
+
+// ── Multi-category comparison sub-handler ──
+// "food vs travel", "compare shopping and entertainment this month"
+// Dynamic: works for ANY two categories from DB + synonyms — never hardcoded.
+function handleCategoryComparison(categories, tr) {
+  const period = timeRangeLabel(tr);
+  const results = categories.map(cat => {
+    const tx = get(
+      `SELECT COALESCE(SUM(amount),0) as t, COUNT(*) as c FROM transactions
+       WHERE LOWER(category) = ? AND timestamp BETWEEN ? AND ?`,
+      [cat.toLowerCase(), tr.start, tr.end]
+    );
+    const sl = get(
+      `SELECT COALESCE(SUM(amount_raw),0) as t, COUNT(*) as c FROM spend_log
+       WHERE LOWER(category) = ? AND occurred_at BETWEEN ? AND ?`,
+      [cat.toLowerCase(), tr.start, tr.end]
+    );
+    // Top merchant in this category for extra context
+    const topMerch = get(
+      `SELECT merchant, SUM(amount) as total FROM transactions
+       WHERE LOWER(category) = ? AND timestamp BETWEEN ? AND ?
+       AND merchant IS NOT NULL GROUP BY merchant ORDER BY total DESC LIMIT 1`,
+      [cat.toLowerCase(), tr.start, tr.end]
+    );
+    return {
+      name: cat.charAt(0).toUpperCase() + cat.slice(1),
+      total: (tx?.t || 0) + (sl?.t || 0),
+      count: (tx?.c || 0) + (sl?.c || 0),
+      topMerchant: topMerch?.merchant || null
+    };
+  }).sort((a, b) => b.total - a.total);
+
+  const lines = [`**${results.map(r => r.name).join(' vs ')}** — ${period}:\n`];
+  for (const r of results) {
+    const topNote = r.topMerchant ? ` (top: ${r.topMerchant})` : '';
+    lines.push(`• ${r.name}: **${fmt(r.total)}** across ${r.count} txn${r.count !== 1 ? 's' : ''}${topNote}`);
+  }
+  if (results.length >= 2 && results[0].total > 0 && results[1].total > 0) {
+    const diff = results[0].total - results[1].total;
+    const pct  = Math.round((diff / results[1].total) * 100);
+    lines.push(`\n→ You spend **${pct}% more** on ${results[0].name} than ${results[1].name} (${fmt(diff)} difference)`);
+  } else if (results[0].total > 0) {
+    lines.push(`\n→ No data for ${results.find(r => r.total === 0)?.name} in this period`);
+  }
+  return { answer: lines.join('\n'), type: 'money', data: { categories: results, period } };
+}
+
+// ── Card / payment method analysis ──
+// "which card did I use most for fuel", "HDFC vs ICICI spend last month"
+// Groups by payment_method column in transactions (added via migration).
+function handleCardAnalysis(category, tr) {
+  const period = timeRangeLabel(tr);
+  const catParam = category ? [category.toLowerCase()] : [];
+  const catWhere = category ? `AND LOWER(category) = ?` : '';
+  const rows = all(
+    `SELECT COALESCE(payment_method, 'Unknown') as card,
+            ROUND(SUM(amount), 2) as total,
+            COUNT(*) as cnt
+     FROM transactions
+     WHERE timestamp BETWEEN ? AND ? ${catWhere}
+       AND payment_method IS NOT NULL AND TRIM(payment_method) != ''
+     GROUP BY payment_method
+     ORDER BY total DESC`,
+    [tr.start, tr.end, ...catParam]
+  );
+
+  if (rows.length === 0) {
+    const catLabel = category ? ` **${category}**` : '';
+    return {
+      answer: `No card data found for${catLabel} in ${period}.\n\n_Tip: When logging transactions, include the card/payment method so ARIA can track per-card spending._`,
+      type: 'money', data: { category, period }
+    };
+  }
+
+  const catLabel = category ? ` **${category.charAt(0).toUpperCase() + category.slice(1)}**` : '';
+  const lines = [`**Card Breakdown**${catLabel} — ${period}:\n`];
+  for (const r of rows) {
+    lines.push(`• ${r.card}: **${fmt(r.total)}** (${r.cnt} txn${r.cnt !== 1 ? 's' : ''})`);
+  }
+  lines.push(`\n→ **${rows[0].card}** used the most${catLabel ? ` for${catLabel}` : ''} (${fmt(rows[0].total)})`);
+  return { answer: lines.join('\n'), type: 'money', data: { cards: rows, category, period } };
+}
+
+// ── Multi-period breakdown: "compare last 3 months food", "Swiggy last 6 months" ──
+// periods = [{start, end, label}] built in extractQueryIntent.
+// Renders a bar chart representation + delta vs previous period.
+function handleMultiPeriodBreakdown(category, merchant, periods) {
+  const subjectLabel = category
+    ? `**${category.charAt(0).toUpperCase() + category.slice(1)}** spending`
+    : merchant
+      ? `**${merchant.charAt(0).toUpperCase() + merchant.slice(1)}** spend`
+      : '**Total spending**';
+
+  const catWhere  = category ? `AND LOWER(category) = '${category.toLowerCase().replace(/'/g, "''")}'` : '';
+  const merchLike = merchant ? merchant.toLowerCase().replace(/'/g, "''"): '';
+  const merchWhere = merchant
+    ? `AND (LOWER(merchant) LIKE '%${merchLike}%' OR LOWER(description) LIKE '%${merchLike}%')`
+    : '';
+
+  const results = periods.map(p => {
+    const tx = get(
+      `SELECT COALESCE(SUM(amount),0) as t, COUNT(*) as c FROM transactions
+       WHERE timestamp BETWEEN ? AND ? ${catWhere} ${merchWhere}`,
+      [p.start, p.end]
+    );
+    const sl = get(
+      `SELECT COALESCE(SUM(amount_raw),0) as t, COUNT(*) as c FROM spend_log
+       WHERE occurred_at BETWEEN ? AND ? ${catWhere} ${merchWhere}`,
+      [p.start, p.end]
+    );
+    return {
+      label:  p.label,
+      total:  (tx?.t || 0) + (sl?.t || 0),
+      count:  (tx?.c || 0) + (sl?.c || 0)
+    };
+  });
+
+  const maxTotal = Math.max(...results.map(r => r.total), 1);
+  const lines = [`${subjectLabel} — period comparison:\n`];
+  for (const r of results) {
+    const bar = '█'.repeat(Math.max(1, Math.round((r.total / maxTotal) * 10)));
+    lines.push(`• **${r.label}**: ${fmt(r.total)} ${bar} (${r.count} txn${r.count !== 1 ? 's' : ''})`);
+  }
+
+  // Delta vs immediately previous period
+  if (results.length >= 2) {
+    const last = results[results.length - 1];
+    const prev = results[results.length - 2];
+    if (prev.total > 0) {
+      const delta    = last.total - prev.total;
+      const deltaPct = Math.round((delta / prev.total) * 100);
+      const arrow    = delta > 0 ? '↑' : '↓';
+      lines.push(`\n${arrow} Latest vs prev period: **${deltaPct > 0 ? '+' : ''}${deltaPct}%** (${delta >= 0 ? '+' : ''}${fmt(Math.abs(delta))})`);
+    }
+  }
+
+  const overallTotal  = results.reduce((s, r) => s + r.total, 0);
+  const avgPerPeriod  = overallTotal / results.length;
+  lines.push(`**Overall**: ${fmt(overallTotal)} total | avg ${fmt(avgPerPeriod)}/period`);
+
+  return { answer: lines.join('\n'), type: 'money', data: { periods: results, subjectLabel } };
 }
 
 // ── Merchant sub-handler ──
@@ -1211,14 +1444,16 @@ function handleTasks(intent) {
     return { answer: lines.join('\n'), type: 'tasks', data: { tasks } };
   }
 
-  // This week
+  // This week / upcoming — use parsed timeRange if available, else default 7-day window
   if (/this\s+week|week|upcoming/.test(low)) {
-    const weekEnd = now + 7 * 86400;
+    const tr = params.timeRange;
+    const rangeStart = tr ? tr.start : now;
+    const rangeEnd   = tr ? tr.end   : now + 7 * 86400;
     const tasks = all(
       `SELECT title, due_at, category, priority_score FROM reminders
        WHERE completed = 0 AND archived_at IS NULL AND due_at BETWEEN ? AND ?
        ORDER BY due_at ASC`,
-      [now, weekEnd]
+      [rangeStart, rangeEnd]
     );
     if (tasks.length === 0) return { answer: 'No tasks due this week. 🎉', type: 'tasks' };
 
@@ -1245,6 +1480,28 @@ function handleTasks(intent) {
       lines.push(`• ✅ ${t.title} — ${fmtDate(t.completed_at)}`);
     }
     return { answer: lines.join('\n'), type: 'tasks', data: { tasks } };
+  }
+
+  // Generic time range: "tasks due next month", "tasks due in March", "tasks by Dec 15"
+  // Uses the parsed params.timeRange from extractQueryIntent
+  if (params.timeRange) {
+    const tr = params.timeRange;
+    const tasks = all(
+      `SELECT title, due_at, category, priority_score FROM reminders
+       WHERE completed = 0 AND archived_at IS NULL AND due_at BETWEEN ? AND ?
+       ORDER BY due_at ASC LIMIT 25`,
+      [tr.start, tr.end]
+    );
+    const period = timeRangeLabel(tr);
+    if (tasks.length === 0) {
+      return { answer: `No tasks due in ${period}. 🎉`, type: 'tasks' };
+    }
+    let lines = [`**Tasks due in ${period}** (${tasks.length}):\n`];
+    for (const t of tasks) {
+      const isOverdue = t.due_at < now;
+      lines.push(`${isOverdue ? '⚠️' : '•'} ${t.title} — ${fmtDate(t.due_at)}`);
+    }
+    return { answer: lines.join('\n'), type: 'tasks', data: { tasks, period } };
   }
 
   // Default: all pending tasks

@@ -110,6 +110,9 @@ function initDatabase() {
     // ── CA/CRED Money upgrade ──
     `ALTER TABLE transactions ADD COLUMN tx_type TEXT DEFAULT 'debit'`,
     `ALTER TABLE transactions ADD COLUMN payment_link TEXT`,
+    // payment_method: card/UPI/cash used for the transaction — enables 'which card for fuel'
+    `ALTER TABLE transactions ADD COLUMN payment_method TEXT`,
+    `CREATE INDEX IF NOT EXISTS idx_tx_payment_method ON transactions(payment_method)`,
     `ALTER TABLE subscriptions ADD COLUMN payment_link TEXT`,
     `ALTER TABLE subscriptions ADD COLUMN sub_type TEXT DEFAULT 'subscription'`,
 
