@@ -550,6 +550,10 @@ function initDatabase() {
     // Chat messages that contain leaked system prompts
     `DELETE FROM chat_messages WHERE (role='bot' OR role='assistant')
        AND (text LIKE 'Classification Line:%' OR text LIKE 'You are ARIA%' OR text LIKE 'Answer:%You are%')`,
+    // Reminders created with junk titles: greeting words, single chars, pure numbers
+    // These come from the "hi" bug or bad email subject extraction
+    `DELETE FROM reminders WHERE length(trim(title)) <= 3
+       OR LOWER(trim(title)) IN ('hi','hey','hello','yo','sup','hiya','ok','yes','no','re')`,
   ];
   for (const s of cleanupStmts) {
     try { db.exec(s); } catch (_) {}

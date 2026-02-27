@@ -372,7 +372,18 @@ async function routeEmailInsights() {
       if (sa.deadline) {
         const deadlineTs = Math.floor(new Date(sa.deadline).getTime() / 1000);
         if (!isNaN(deadlineTs) && deadlineTs > now - 86400) {
-          const title = (email.subject || 'Email task').substring(0, 100);
+          // Clean the subject: strip promotional prefixes, truncate, skip pure noise
+          let rawTitle = (email.subject || 'Email task')
+            .replace(/^(Re:|Fwd:|FW:|Fw:|\[EXTERNAL\]|\[SPAM\]|\*\*.*?\*\*)/i, '')
+            .trim();
+          // Skip promotional/marketing emails — they shouldn't become tasks
+          const isPromo = /\b(unsubscribe|offer|deal|discount|sale|newsletter|promotion|marketing|coupon|% off|free trial|upgrade your|introducing|announcement|opt.?out)\b/i.test(rawTitle);
+          if (isPromo) continue;
+          // Skip absurdly long subjects (full marketing blurb)
+          if (rawTitle.length > 80) rawTitle = rawTitle.substring(0, 77) + '...';
+          // Skip if title is shorter than 4 chars (noise like "hi", "re", etc.)
+          if (rawTitle.trim().length < 4) continue;
+          const title = rawTitle;
           const existing = get(
             `SELECT id FROM reminders WHERE LOWER(title) = LOWER(?) AND completed = 0`,
             [title]
@@ -402,7 +413,13 @@ async function routeEmailInsights() {
 
       // Create task from urgent/required-action if no deadline (due = 24h from now)
       if (!sa.deadline && sa.recommended_action === 'Required' && (sa.urgent || sa.risk_level === 'High')) {
-        const title = (email.subject || 'Urgent email').substring(0, 100);
+        let rawUrgTitle = (email.subject || 'Urgent email')
+          .replace(/^(Re:|Fwd:|FW:|Fw:|\[EXTERNAL\]|\[SPAM\])/i, '').trim();
+        const isPromo2 = /\b(unsubscribe|offer|deal|discount|sale|newsletter|promotion|free trial|upgrade your|introducing)\b/i.test(rawUrgTitle);
+        if (isPromo2) continue;
+        if (rawUrgTitle.trim().length < 4) continue;
+        if (rawUrgTitle.length > 80) rawUrgTitle = rawUrgTitle.substring(0, 77) + '...';
+        const title = rawUrgTitle;
         const existing = get(
           `SELECT id FROM reminders WHERE LOWER(title) = LOWER(?) AND completed = 0`,
           [title]
@@ -3292,19 +3309,29 @@ Body: ${(bodyPreview || '').substring(0, 500)}`;
         }
       } catch (_) {}
 
-      // ── Fallback: clean compact summary if Ollama is offline ─────────────
+      // ── Fallback: clean readable sentences if Ollama is offline/slow ──────
+      // Do NOT dump the raw facts strings — build a plain human-readable line.
       if (!briefingText) {
-        if (facts.length > 0) {
-          const top = facts.slice(0, 2).join(' | ');
-          const timeGreet = hour < 12 ? 'Morning' : hour < 17 ? 'Afternoon' : 'Evening';
-          const name = userName ? `, ${userName}` : '';
-          briefingText = `${timeGreet}${name}. ${top}`;
-        } else {
-          const timeGreet = hour < 12 ? 'Morning' : hour < 17 ? 'Afternoon' : 'Evening';
-          const name = userName ? `, ${userName}` : '';
-          briefingText = `${timeGreet}${name}. Nothing urgent right now.`;
+        const timeGreet = hour < 12 ? 'Morning' : hour < 17 ? 'Afternoon' : 'Evening';
+        const nameStr = userName ? `, ${userName}` : '';
+        const parts = [];
+        if (overdueRows.length > 0) {
+          // Show max 2 task names, keep it short
+          const names = overdueRows.slice(0, 2).map(r => `"${r.title.substring(0, 35)}"`).join(' and ');
+          parts.push(`${overdueRows.length} overdue task${overdueRows.length > 1 ? 's' : ''} — most urgent: ${names}`);
+        } else if (imminentRows.length > 0) {
+          parts.push(`${imminentRows.length} task${imminentRows.length > 1 ? 's' : ''} due today`);
         }
-        console.log(`[AI] GREETING — Ollama offline, used compact fallback`);
+        if (urgentEmailCount > 0) {
+          parts.push(`${urgentEmailCount} urgent email${urgentEmailCount > 1 ? 's' : ''} unread`);
+        }
+        if (renewingSoon.length > 0) {
+          parts.push(`${renewingSoon[0].name} renewing soon (\u20b9${renewingSoon[0].amount})`);
+        }
+        briefingText = parts.length > 0
+          ? `${timeGreet}${nameStr}. ${parts.join('. ')}.`
+          : `${timeGreet}${nameStr}. Nothing urgent.`;
+        console.log(`[AI] GREETING — Ollama offline, used clean fallback`);
       }
 
       // Follow-ups based on what's actually present
