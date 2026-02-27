@@ -78,7 +78,7 @@ function createFallbackIcon() {
 }
 
 // Services — imported after DB init
-let aiService, gmailService, calendarService, remindService, briefingService, weatherService, habitsService, focusService, weeklyReportService, nlQueryService, analyticsService, calendarIntelService, financialIntel, intelligenceService, responseCacheService;
+let aiService, gmailService, calendarService, remindService, briefingService, weatherService, habitsService, focusService, weeklyReportService, nlQueryService, analyticsService, calendarIntelService, financialIntel, intelligenceService, responseCacheService, memoryExtractService;
 
 // ── Python Sidecar (P2-1) — with auto-restart, heartbeat, and delta streaming ─────────────────────────────────────────────────
 // Spawns python-engine/engine.py as a child process.
@@ -3111,6 +3111,12 @@ Body: ${(bodyPreview || '').substring(0, 500)}`;
       console.log(`[SessionMemory] Stored preference: "${detectedPref.key}" (TTL: ${detectedPref.ttl}d)`);
     }
 
+    // 0a. Passive fact extraction — learn structured facts from every message (no LLM, regex only)
+    if (memoryExtractService) {
+      const learned = memoryExtractService.extractAndSave(message);
+      if (learned > 0) console.log(`[MemoryExtract] Learned ${learned} new fact(s)`);
+    }
+
     // 0b. P10-4: Context Memory — extract entities and link to context threads
     try {
       const ctxResult = processContextMemory(message, 'chat', 'chat', `chat-${Date.now()}`);
@@ -3145,6 +3151,34 @@ Body: ${(bodyPreview || '').substring(0, 500)}`;
         }
       }
 
+      // ── TIER 0c: Persistent query cache — answers from previous sessions (SQLite) ──
+      if (memoryExtractService) {
+        const persisted = memoryExtractService.recallAnswer(message);
+        if (persisted) {
+          console.log(`[AI] Persistent cache HIT (${persisted.source}, served ${persisted.hit_count}x) — "${message.substring(0, 40)}"`);
+          const pResult = { text: persisted.answer_text, followUps: [], mode: mode || 'work', aiProvider: `persisted-${persisted.source}` };
+          if (responseCacheService) responseCacheService.set(message, pResult, 300);
+          return pResult;
+        }
+      }
+
+      // ── TIER 0d: Memory recall — "what is my name" → ai_memory → instant, no LLM ──
+      const RECALL_RE = /^(?:what(?:'s|\s+is)\s+my|who\s+(?:is\s+my|am\s+i)\b|where\s+do\s+i\s+(?:live|work)\b|do\s+you\s+(?:know|remember)\s+my|what(?:'s|\s+was)\s+my)\s*/i;
+      if (RECALL_RE.test(message.trim()) && memoryExtractService) {
+        const topic = message.trim().replace(RECALL_RE, '').replace(/[?!.]+$/, '').trim().toLowerCase();
+        if (topic.length >= 2) {
+          const factsText = memoryExtractService.recallFacts(topic);
+          if (factsText) {
+            console.log(`[AI] Memory recall HIT for topic: "${topic}"`);
+            try { run(`INSERT INTO chat_messages (role, text, created_at) VALUES (?, ?, ?)`, ['assistant', factsText.substring(0, 2000), nowUnix()]); } catch (_) {}
+            memoryExtractService.saveAnswer(message, `[STATUS] ${factsText}`, 'memory-recall', 86400 * 7);
+            const recallResult = { text: `[STATUS] ${factsText}`, followUps: ['What else do you know about me?', 'Update my profile'], mode: mode || 'work', aiProvider: 'memory-recall' };
+            if (responseCacheService) responseCacheService.set(message, recallResult, 600);
+            return recallResult;
+          }
+        }
+      }
+
       if (nlQueryService && nlQueryService.isDataQuery(message)) {
         const queryResult = nlQueryService.processQuery(message);
         if (queryResult.answer) {
@@ -3161,6 +3195,8 @@ Body: ${(bodyPreview || '').substring(0, 500)}`;
           };
           // Cache data query answers for 5 min (they're time-relative, e.g. "this week")
           if (responseCacheService) responseCacheService.set(message, result, 300);
+          // Persist in query_answers (TTL 1hr — data changes but not every minute)
+          if (memoryExtractService) memoryExtractService.saveAnswer(message, result.text, 'sql', 3600);
           return result;
         }
       }
@@ -3209,10 +3245,8 @@ Body: ${(bodyPreview || '').substring(0, 500)}`;
           const toolNames = (agentResult.tools_used || []).map(t => t.name).join(', ');
           console.log(`[AI] Agent responded via ${agentResult.model} (${agentResult.iterations} iterations, tools: ${toolNames || 'none'})`);
 
-          // Store agent's response in chat_messages for conversation continuity
-          try {
-            run(`INSERT INTO chat_messages (role, text, created_at) VALUES (?, ?, ?)`, ['assistant', mainText.substring(0, 2000), nowUnix()]);
-          } catch (_) {}
+          // NOTE: chat_messages storage is handled by the frontend (useChat.js saveChatMessage).
+          // Backend storing here would cause duplicates — removed intentionally.
 
           // Phase F write-back: extract entities from conversation and store to context_entities
           try {
@@ -3234,6 +3268,16 @@ Body: ${(bodyPreview || '').substring(0, 500)}`;
               }
             }
           } catch (_) {}
+
+          // Persist agent answer so future identical questions skip Ollama entirely.
+          // Skip time-sensitive tool results (calendar, weather) — those must stay live.
+          const _timeTools = new Set(['get_calendar_events', 'get_weather', 'refresh_emails']);
+          const _isFactual = !(agentResult.tools_used || []).some(t => _timeTools.has(t.name));
+          if (_isFactual && memoryExtractService) {
+            memoryExtractService.saveAnswer(message, mainText, 'agent', 3600);
+            // Also mine the agent's reply for facts about the user that ARIA deduced
+            memoryExtractService.extractAndSave(`${message} ${mainText}`);
+          }
 
           return {
             text: mainText,
@@ -3431,12 +3475,14 @@ Body: ${(bodyPreview || '').substring(0, 500)}`;
       } catch (_) {}
     }
 
-    // 4. Store memory if user is sharing a fact
+    // 4. Store memory if user is sharing a fact (explicit) — deduped via memoryExtractService
     const memoryPatterns = /^(remember|note|my name is|i am|i work|i live|i prefer|i like|my)\b/i;
     if (memoryPatterns.test(message)) {
-      try {
-        run('INSERT INTO ai_memory (fact, source) VALUES (?, ?)', [message, 'chat']);
-      } catch (_) {}
+      if (memoryExtractService) {
+        memoryExtractService.saveExplicitFact(message, 'chat');
+      } else {
+        try { run('INSERT INTO ai_memory (fact, source) VALUES (?, ?)', [message, 'chat']); } catch (_) {}
+      }
     }
 
     // 5. Mode-specific personality hints
@@ -4977,6 +5023,9 @@ app.whenReady().then(async () => {
   intelligenceService = require('../services/intelligence.js');
   responseCacheService = require('../services/response-cache.js');
   console.log('[ARIA] Response cache initialized');
+  memoryExtractService = require('../services/memory-extract.js');
+  memoryExtractService.init(require('../db/index.js'));
+  console.log('[ARIA] Memory extract service initialized');
   try {
     const keytar = require('keytar');
     const gmailOAuthSvc = require('../services/gmail-oauth.js');

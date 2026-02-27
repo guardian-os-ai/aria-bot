@@ -417,6 +417,24 @@ function initDatabase() {
       details TEXT,
       created_at INTEGER DEFAULT (strftime('%s','now'))
     )`,
+
+    // ── Persistent Q+A cache — cross-session SQL/agent answer store ──────────
+    // query_norm  = normalized query (lowercase, stripped punctuation) — unique key
+    // ttl_secs    = answer validity window (3600 for sql/agent, 604800 for recall facts)
+    // hit_count   = how many times this answer was served without an LLM call
+    `CREATE TABLE IF NOT EXISTS query_answers (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      query_norm  TEXT    NOT NULL UNIQUE,
+      query_text  TEXT    NOT NULL,
+      answer_text TEXT    NOT NULL,
+      source      TEXT    DEFAULT 'sql',
+      ttl_secs    INTEGER DEFAULT 3600,
+      hit_count   INTEGER DEFAULT 1,
+      created_at  INTEGER DEFAULT (strftime('%s','now')),
+      last_hit_at INTEGER DEFAULT (strftime('%s','now'))
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_qa_norm ON query_answers(query_norm)`,
+    `CREATE INDEX IF NOT EXISTS idx_qa_source ON query_answers(source)`,
   ];
   for (const migration of migrations) {
     try { db.exec(migration); } catch (e) { /* column already exists — ignore */ }
