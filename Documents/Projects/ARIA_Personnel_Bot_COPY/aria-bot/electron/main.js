@@ -3188,43 +3188,138 @@ Body: ${(bodyPreview || '').substring(0, 500)}`;
   };
 
   async function chatEnhancedHandler(message, mode) {
-    // ── FAST PATH: greetings & trivial messages — instant response, no LLM ──
+    // ── GREETING: Gather real data → Ollama synthesizes → one intelligent briefing ──
+    // NOT a fast-path template. A fast SQL gather + ONE Ollama call for synthesis.
+    // The difference between a bot and an agent: this reasons, it doesn't template-fill.
     const GREETING_RE = /^(hi|hey|hello|yo|sup|hiya|howdy|morning|good morning|good afternoon|good evening|gm|whats up|what's up|hii+|helo|namaste|ola)[\s!?.]*$/i;
     if (GREETING_RE.test(message.trim())) {
-      const userName = getSetting('user_name') || '';
-      const hour = new Date().getHours();
-      const timeGreet = hour < 12 ? 'Morning' : hour < 17 ? 'Afternoon' : 'Evening';
-      const name = userName ? `, ${userName}` : '';
+      const now    = nowUnix();
+      const hour   = new Date().getHours();
+      const timeOfDay = hour < 12 ? 'morning' : hour < 17 ? 'afternoon' : 'evening';
+      const userName  = getSetting('user_name') || '';
 
-      // Quick stats for context-aware greeting
-      const taskCount = get(`SELECT COUNT(*) as cnt FROM reminders WHERE completed = 0 AND archived_at IS NULL`)?.cnt || 0;
-      const urgentEmails = get(`SELECT COUNT(*) as cnt FROM email_cache WHERE category IN ('urgent','action') AND is_read = 0`)?.cnt || 0;
-      const overdueCount = get(`SELECT COUNT(*) as cnt FROM reminders WHERE completed = 0 AND archived_at IS NULL AND due_at < ?`, [nowUnix()])?.cnt || 0;
+      // ── Step 1: SQL data gather (< 5ms, no LLM) ──────────────────────────
+      const overdueRows = all(
+        `SELECT title, due_at FROM reminders
+         WHERE completed=0 AND archived_at IS NULL AND due_at < ?
+         ORDER BY due_at ASC LIMIT 4`,
+        [now]
+      ) || [];
+      const imminentRows = all(
+        `SELECT title, due_at FROM reminders
+         WHERE completed=0 AND archived_at IS NULL AND due_at BETWEEN ? AND ?
+         ORDER BY due_at ASC LIMIT 3`,
+        [now, now + 86400]
+      ) || [];
+      const urgentEmailCount = get(
+        `SELECT COUNT(*) as cnt FROM email_cache WHERE category IN ('urgent','action') AND is_read=0`
+      )?.cnt || 0;
+      const renewingSoon = all(
+        `SELECT name, amount FROM subscriptions
+         WHERE next_renewal BETWEEN ? AND ?
+         ORDER BY next_renewal ASC LIMIT 3`,
+        [now, now + 3 * 86400]
+      ) || [];
+      const topSpend = all(
+        `SELECT category, SUM(amount) as total FROM transactions
+         WHERE timestamp >= CAST(strftime('%s', date('now','start of month')) AS INTEGER)
+         GROUP BY category ORDER BY total DESC LIMIT 2`
+      ) || [];
+      const activeGoals = (() => {
+        try { return goalsService ? goalsService.getActiveGoals().slice(0, 2) : []; } catch (_) { return []; }
+      })();
 
-      let statusLine = '';
-      if (overdueCount > 0) statusLine = `You have ${overdueCount} overdue task${overdueCount > 1 ? 's' : ''}. Want me to walk through them?`;
-      else if (urgentEmails > 0) statusLine = `${urgentEmails} email${urgentEmails > 1 ? 's' : ''} need attention. Want a summary?`;
-      else if (taskCount > 0) statusLine = `${taskCount} open task${taskCount > 1 ? 's' : ''}, nothing urgent. You're clear.`;
-      else statusLine = 'No urgent items. You\'re clear.';
+      // ── Step 2: Build compact fact block for Ollama ───────────────────────
+      const facts = [];
+      if (overdueRows.length > 0) {
+        const titles = overdueRows.map(r => {
+          const daysLate = Math.floor((now - r.due_at) / 86400);
+          return `"${r.title}" (${daysLate}d overdue)`;
+        }).join(', ');
+        facts.push(`${overdueRows.length} overdue task(s): ${titles}`);
+      }
+      if (imminentRows.length > 0) {
+        const titles = imminentRows.map(r => {
+          const h = new Date(r.due_at * 1000).getHours();
+          const ampm = h < 12 ? 'AM' : 'PM';
+          return `"${r.title}" at ${h % 12 || 12}${ampm}`;
+        }).join(', ');
+        facts.push(`Tasks due in 24h: ${titles}`);
+      }
+      if (urgentEmailCount > 0) {
+        facts.push(`${urgentEmailCount} unread urgent/action email(s)`);
+      }
+      if (renewingSoon.length > 0) {
+        const items = renewingSoon.map(r => `${r.name} (₹${r.amount})`).join(', ');
+        facts.push(`Subscriptions renewing in 3 days: ${items}`);
+      }
+      if (topSpend.length > 0) {
+        const items = topSpend.map(r => `${r.category} ₹${Math.round(r.total)}`).join(', ');
+        facts.push(`This month's top spend: ${items}`);
+      }
+      for (const goal of activeGoals) {
+        try {
+          const p = goalsService.checkGoalProgress(goal);
+          const status = p.status === 'exceeded' ? 'OVER TARGET' : p.status === 'at_risk' ? 'at risk' : 'on track';
+          facts.push(`Goal "${goal.title}": ${p.pctUsed}% used, ${100 - p.pctElapsed}% of ${goal.period} left — ${status}`);
+        } catch (_) {}
+      }
 
-      // Proactive intelligence — surface anomalies, renewals, streak risks
-      let proactiveBlock = '';
+      // ── Step 3: Ollama synthesis — one call, real reasoning ──────────────
+      // If Ollama is offline or slow, fall back to a clean compact summary (no wall of bullets).
+      let briefingText = '';
       try {
-        if (intelligenceService) {
-          proactiveBlock = intelligenceService.formatInsightsForGreeting(2);
+        const ollama = require('../services/ollama');
+        const isUp   = await ollama.isRunning().catch(() => false);
+        if (isUp && facts.length > 0) {
+          const userLabel = userName ? `User's name: ${userName}. ` : '';
+          const factBlock = facts.join('\n- ');
+          const synthesisPrompt =
+            `${userLabel}It is ${timeOfDay}. The user just said hello.\n\n` +
+            `Current state:\n- ${factBlock}\n\n` +
+            `Write a 1–2 sentence briefing. Rules:\n` +
+            `- Synthesize and CONNECT facts where relevant (e.g. if subscription renews AND budget is tight, link them)\n` +
+            `- Be specific: use actual task names, amounts, counts\n` +
+            `- Prioritize the single most action-worthy thing\n` +
+            `- No bullet points. No "Here is your briefing:" intro. No questions unless exactly ONE follow-up is natural.\n` +
+            `- Tone: sharp executive assistant, not a bot`;
+          const raw = await ollama.call('llama3.2:3b', [
+            { role: 'system', content: 'You are ARIA, a sharp personal executive AI. When the user greets you, give a synthesized briefing of their actual situation, not a list. Be direct and specific.' },
+            { role: 'user', content: synthesisPrompt }
+          ], { temperature: 0.2, max_tokens: 120, timeout: 8000 });
+          briefingText = raw?.trim() || '';
+          console.log(`[AI] GREETING — Ollama synthesized briefing`);
         }
       } catch (_) {}
 
-      // Active goals summary — the agent tracking what the user cares about
-      let goalsBlock = '';
-      try { if (goalsService) goalsBlock = goalsService.getGoalSummaryForGreeting(); } catch (_) {}
+      // ── Fallback: clean compact summary if Ollama is offline ─────────────
+      if (!briefingText) {
+        if (facts.length > 0) {
+          const top = facts.slice(0, 2).join(' | ');
+          const timeGreet = hour < 12 ? 'Morning' : hour < 17 ? 'Afternoon' : 'Evening';
+          const name = userName ? `, ${userName}` : '';
+          briefingText = `${timeGreet}${name}. ${top}`;
+        } else {
+          const timeGreet = hour < 12 ? 'Morning' : hour < 17 ? 'Afternoon' : 'Evening';
+          const name = userName ? `, ${userName}` : '';
+          briefingText = `${timeGreet}${name}. Nothing urgent right now.`;
+        }
+        console.log(`[AI] GREETING — Ollama offline, used compact fallback`);
+      }
 
-      console.log(`[AI] FAST PATH greeting — skipped LLM entirely`);
+      // Follow-ups based on what's actually present
+      const followUps = [];
+      if (overdueRows.length > 0) followUps.push('Show overdue tasks');
+      if (urgentEmailCount > 0)   followUps.push('Summarize urgent emails');
+      if (renewingSoon.length > 0) followUps.push('Show renewing subscriptions');
+      if (followUps.length < 2)   followUps.push('Plan my day');
+      if (followUps.length < 2)   followUps.push("What's on today?");
+
       return {
-        text: `${timeGreet}${name}. ${statusLine}${proactiveBlock}${goalsBlock}`,
-        followUps: overdueCount > 0 ? ['Show overdue tasks', 'Plan my day'] : urgentEmails > 0 ? ['Summarize emails', 'Plan my day'] : ['Plan my day', 'What\'s new?'],
+        text: briefingText,
+        followUps: followUps.slice(0, 3),
         mode: mode || 'work',
-        aiProvider: 'fast-path'
+        aiProvider: briefingText && briefingText.length > 60 ? 'ollama' : 'fast-path'
       };
     }
 
