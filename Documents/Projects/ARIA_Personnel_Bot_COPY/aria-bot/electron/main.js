@@ -4598,17 +4598,34 @@ After your response, on a NEW LINE starting with "FOLLOW_UP:", suggest 2-3 brief
     let match;
     const seen = new Set();
 
+    // Expanded stopwords — includes question words, common sentence starters,
+    // greetings, day names, months, modal verbs that get capitalized in messages.
+    const commonWords = new Set([
+      'The','This','That','There','Here','Today','Tomorrow',
+      'Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday',
+      'January','February','March','April','May','June','July','August',
+      'September','October','November','December',
+      'Please','Thanks','Hello','Dear','Best','Regards','Subject','From','Sent',
+      'Meeting','Reminder','Task','Email','Note','Update','Status','Report','Budget','Review',
+      // Question/pronoun words that appear capitalized at start of sentence
+      'What','Which','Where','When','Why','Who','Whose','Whom','How','Any','Some',
+      'Would','Could','Should','Shall','Will','Might','Must','Can','Have','Has','Had',
+      'Does','Did','Show','Tell','Find','Give','Help','Make','Send','Get','Set','Add',
+      'Your','Their','Our','Its','We','You','He','She','They','My','His','Her',
+      'Also','Just','Only','Very','More','Most','Less','New','Old','Good','Bad',
+      'Sure','Right','Okay','Great','Sorry','Yes','No','Not','But','And','Yet',
+      'Plan','Day','Week','Month','Year','Time','Work','Life','User',
+      // Common response starters that get capitalized
+      'Action','Status','Risk','Result','Summary','Here','Below','Above',
+    ]);
+
     while ((match = companyPatterns.exec(text)) !== null) {
       const val = match[1].trim();
-      if (val.length > 2 && val.length < 50 && !seen.has(val.toLowerCase())) {
-        // Filter out common English words that happen to be capitalized
-        const commonWords = new Set(['The','This','That','There','Here','Today','Tomorrow','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday','January','February','March','April','May','June','July','August','September','October','November','December','Please','Thanks','Hello','Dear','Best','Regards','Subject','From','Sent','Meeting','Reminder','Task','Email','Note','Update','Status','Report','Budget','Review','What','Which','Where','When','Why','Who','Whose','Whom','How','Would','Could','Should','Shall','Will','Might','Must','Can','Have','Has','Had','Does','Did','Show','Tell','Find','Give','Help','Make','Send','Get','Set','Add']);
-        if (!commonWords.has(val)) {
-          seen.add(val.toLowerCase());
-          // Determine if it's a person or company
-          const type = /(?:Corp|Inc|Ltd|LLC|Solutions|Technologies|Tech|Services|Group|Labs|Studio|Digital|Media|Capital|Partners)$/i.test(val) ? 'company' : 'person';
-          entities.push({ type, value: val });
-        }
+      // Require at least 4 chars and not in stopword list
+      if (val.length > 3 && val.length < 50 && !seen.has(val.toLowerCase()) && !commonWords.has(val)) {
+        seen.add(val.toLowerCase());
+        const type = /(?:Corp|Inc|Ltd|LLC|Solutions|Technologies|Tech|Services|Group|Labs|Studio|Digital|Media|Capital|Partners)$/i.test(val) ? 'company' : 'person';
+        entities.push({ type, value: val });
       }
     }
 
@@ -4758,8 +4775,16 @@ After your response, on a NEW LINE starting with "FOLLOW_UP:", suggest 2-3 brief
       const entities = extractEntities(text);
       if (entities.length === 0) return null;
 
-      // Group entities into a topic (use the first company/project, or first entity)
-      const topicEntity = entities.find(e => e.type === 'project' || e.type === 'company') || entities[0];
+      // Only use company or project as topic — person entities are often false positives.
+      // Require topic value to be >= 4 chars and not a question word.
+      const STOPWORDS = new Set(['what','how','why','who','when','where','any','some','hi','hey','the','is','are','was','were','plan','task','note','email']);
+      const topicEntity =
+        entities.find(e => e.type === 'project') ||
+        entities.find(e => e.type === 'company') ||
+        entities.find(e => e.type === 'topic' && e.value.length >= 4 && !STOPWORDS.has(e.value.toLowerCase())) ||
+        entities.find(e => e.type === 'person' && e.value.split(' ').length >= 2); // only use 2-word person names
+      if (!topicEntity) return null; // no valid topic — skip
+
       const topic = topicEntity.value;
 
       const threadId = findOrCreateContextThread(topic, entities);

@@ -152,19 +152,12 @@ function initDatabase() {
       created_at INTEGER DEFAULT (strftime('%s','now'))
     )`,
 
-    // Seed default reply templates (ignore if already exist)
-    `INSERT OR IGNORE INTO reply_templates (shortcut, title, body) VALUES
-      ('@@thanks', 'Thank You', 'Thank you for your email. I appreciate you reaching out and will get back to you shortly.'),
-      ('@@meeting', 'Schedule Meeting', 'I would be happy to discuss this further. Could you share your availability for a quick call this week?'),
-      ('@@ack', 'Acknowledged', 'Got it, thanks for the update. I will review and follow up if needed.'),
-      ('@@delay', 'Need More Time', 'Thanks for following up. I need a bit more time to look into this — I will get back to you by end of week.')`,
-
-    // Seed default note templates
-    `INSERT OR IGNORE INTO note_templates (name, content) VALUES
-      ('Meeting Notes', '# Meeting Notes\n\nDate: \nAttendees: \n\n## Agenda\n- \n\n## Discussion\n- \n\n## Action Items\n- [ ] \n\n## Next Steps\n- '),
-      ('Project Brief', '# Project Brief\n\n## Objective\n\n## Scope\n\n## Timeline\n\n## Key Stakeholders\n\n## Success Metrics\n\n## Risks & Mitigations\n'),
-      ('Daily Standup', '# Standup — \n\n## Yesterday\n- \n\n## Today\n- \n\n## Blockers\n- None'),
-      ('Decision Log', '# Decision\n\nDate: \nDecision: \n\n## Context\n\n## Options Considered\n1. \n2. \n\n## Rationale\n\n## Impact\n')`,
+    // ── UNIQUE index on note_templates.name — fixes duplicate seeding bug.
+    //    First deduplicate existing rows (idempotent), then create the index.
+    //    Without this, INSERT OR IGNORE has nothing to conflict against and
+    //    inserts 4 new rows EVERY startup.
+    `DELETE FROM note_templates WHERE id NOT IN (SELECT MIN(id) FROM note_templates GROUP BY name)`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_note_template_name ON note_templates(name)`,
 
     // ── Phase 2: Full SaaS Consolidation ──
 
@@ -509,6 +502,57 @@ function initDatabase() {
   ];
   for (const migration of migrations) {
     try { db.exec(migration); } catch (e) { /* column already exists — ignore */ }
+  }
+
+  // ── Seed-once: templates, defaults — guarded by settings flag ────────────
+  // Runs ONCE ever, not on every startup. The flag prevents re-seeding.
+  const alreadySeeded = db.prepare('SELECT value FROM settings WHERE key=?').get('db_seeded_v2');
+  if (!alreadySeeded) {
+    const seedStmts = [
+      // Reply templates — shortcut has UNIQUE so INSERT OR IGNORE works
+      `INSERT OR IGNORE INTO reply_templates (shortcut, title, body) VALUES
+        ('@@thanks', 'Thank You', 'Thank you for your email. I appreciate you reaching out and will get back to you shortly.'),
+        ('@@meeting', 'Schedule Meeting', 'I would be happy to discuss this further. Could you share your availability for a quick call this week?'),
+        ('@@ack', 'Acknowledged', 'Got it, thanks for the update. I will review and follow up if needed.'),
+        ('@@delay', 'Need More Time', 'Thanks for following up. I need a bit more time to look into this — I will get back to you by end of week.')`,
+
+      // Note templates — name now has UNIQUE index so INSERT OR IGNORE works
+      `INSERT OR IGNORE INTO note_templates (name, content) VALUES
+        ('Meeting Notes', '# Meeting Notes\n\nDate: \nAttendees: \n\n## Agenda\n- \n\n## Discussion\n- \n\n## Action Items\n- [ ] \n\n## Next Steps\n- '),
+        ('Project Brief', '# Project Brief\n\n## Objective\n\n## Scope\n\n## Timeline\n\n## Key Stakeholders\n\n## Success Metrics\n\n## Risks & Mitigations\n'),
+        ('Daily Standup', '# Standup — \n\n## Yesterday\n- \n\n## Today\n- \n\n## Blockers\n- None'),
+        ('Decision Log', '# Decision\n\nDate: \nDecision: \n\n## Context\n\n## Options Considered\n1. \n2. \n\n## Rationale\n\n## Impact\n')`,
+
+      // Mark seeded
+      `INSERT OR REPLACE INTO settings (key, value) VALUES ('db_seeded_v2', '1')`,
+    ];
+    for (const s of seedStmts) {
+      try { db.exec(s); } catch (_) {}
+    }
+    console.log('[DB] Templates seeded (first run)');
+  }
+
+  // ── Startup cleanup: remove junk data that accumulates over time ──────────
+  // Runs on every startup but is fast (indexed deletes).
+  const cleanupStmts = [
+    // Context threads extracted from question words like "What", "How", "Any"
+    `DELETE FROM context_threads WHERE length(trim(topic)) <= 4
+       OR LOWER(trim(topic)) IN ('what','how','why','who','when','where','any','hi','hey','the','and','is')`,
+    // Garbage entities — stopwords/question words tagged as people
+    `DELETE FROM context_entities WHERE length(trim(entity_value)) <= 2
+       OR LOWER(trim(entity_value)) IN ('what','how','why','who','when','where','any','hi','hey','the','and','is','are','was','were')`,
+    // Orphaned context links (thread was deleted)
+    `DELETE FROM context_links WHERE thread_id NOT IN (SELECT id FROM context_threads)`,
+    // Expired session preferences
+    `DELETE FROM session_preferences WHERE expires_at IS NOT NULL AND expires_at < CAST(strftime('%s','now') AS INTEGER)`,
+    // Duplicate chat messages (same role + text stored twice — bot+assistant bug)
+    `DELETE FROM chat_messages WHERE id NOT IN (SELECT MIN(id) FROM chat_messages GROUP BY role, text)`,
+    // Chat messages that contain leaked system prompts
+    `DELETE FROM chat_messages WHERE (role='bot' OR role='assistant')
+       AND (text LIKE 'Classification Line:%' OR text LIKE 'You are ARIA%' OR text LIKE 'Answer:%You are%')`,
+  ];
+  for (const s of cleanupStmts) {
+    try { db.exec(s); } catch (_) {}
   }
 
   console.log('[DB] Database initialized successfully');
