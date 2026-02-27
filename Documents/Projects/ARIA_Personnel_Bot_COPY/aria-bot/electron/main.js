@@ -78,7 +78,7 @@ function createFallbackIcon() {
 }
 
 // Services — imported after DB init
-let aiService, gmailService, calendarService, remindService, briefingService, weatherService, habitsService, focusService, weeklyReportService, nlQueryService, analyticsService, calendarIntelService, financialIntel, intelligenceService;
+let aiService, gmailService, calendarService, remindService, briefingService, weatherService, habitsService, focusService, weeklyReportService, nlQueryService, analyticsService, calendarIntelService, financialIntel, intelligenceService, responseCacheService;
 
 // ── Python Sidecar (P2-1) — with auto-restart, heartbeat, and delta streaming ─────────────────────────────────────────────────
 // Spawns python-engine/engine.py as a child process.
@@ -3130,6 +3130,42 @@ Body: ${(bodyPreview || '').substring(0, 500)}`;
     const isWeatherQuery = /^(what.*weather|how.*outside|temperature)/i.test(message);
     const isReplyRequest = /^(?:reply|send\s+(?:a\s+)?reply)\s+(?:to\s+)?/i.test(message);
 
+    // ── TIER 1: Structured data query fast-path — pure SQL, zero LLM ──────────
+    // Must run BEFORE the agent so "how much did I spend on food?", "show overdue tasks",
+    // "list subscriptions" etc. never hit Ollama.
+    // isDataQuery() has built-in guards: skips action verbs (remind/add/delete/send)
+    // and AI-reasoning phrases (should I / recommend / suggest).
+    if (!isReminderRequest && !isEmailRefresh && !isWeatherQuery && !isReplyRequest) {
+      // ── TIER 0b: Response cache — serves repeated queries instantly (zero SQL, zero LLM) ──
+      if (responseCacheService) {
+        const cached = responseCacheService.get(message);
+        if (cached) {
+          console.log(`[AI] Cache HIT — returning cached response for: "${message.substring(0, 40)}"`);
+          return { ...cached, aiProvider: 'cache' };
+        }
+      }
+
+      if (nlQueryService && nlQueryService.isDataQuery(message)) {
+        const queryResult = nlQueryService.processQuery(message);
+        if (queryResult.answer) {
+          console.log(`[AI] TIER-1 fast-path (data-query) — skipped LLM entirely`);
+          const followUps = _getFollowUps(queryResult.type, message);
+          const result = {
+            text: `📊 ${queryResult.answer}`,
+            action: 'query_answered',
+            queryType: queryResult.type,
+            data: queryResult.data,
+            followUps,
+            mode: mode || 'work',
+            aiProvider: 'local-query'
+          };
+          // Cache data query answers for 5 min (they're time-relative, e.g. "this week")
+          if (responseCacheService) responseCacheService.set(message, result, 300);
+          return result;
+        }
+      }
+    }
+
     // If NOT an actionable intent, route through the intelligent agent (STREAMING)
     if (!isReminderRequest && !isEmailRefresh && !isWeatherQuery && !isReplyRequest) {
       try {
@@ -3375,14 +3411,23 @@ Body: ${(bodyPreview || '').substring(0, 500)}`;
     }
 
     if (intent === 'weather' || /^(what.*weather|how.*outside|temperature)/i.test(message)) {
+      // Check cache first — weather valid for 10 min
+      const cachedWeather = responseCacheService && responseCacheService.get('__weather__');
+      if (cachedWeather) {
+        console.log('[AI] Cache HIT — weather (10 min TTL)');
+        return { ...cachedWeather, aiProvider: 'cache' };
+      }
       try {
         const w = await weatherService.getWeather();
-        return {
+        const weatherResult = {
           text: `${w.emoji} ${w.condition} in ${w.city} — ${w.temp}° (feels ${w.feels_like}°). High ${w.high}°, Low ${w.low}°. ${w.rain_chance > 30 ? `🌧 ${w.rain_chance}% rain chance.` : ''}`,
           action: 'weather_shown',
           followUps: ['Should I carry an umbrella?', 'Tomorrow\'s forecast?'],
           mode: mode || 'work'
         };
+        // Cache under a fixed key so any weather-phrased query hits the same entry
+        if (responseCacheService) responseCacheService.set('__weather__', weatherResult, 600);
+        return weatherResult;
       } catch (_) {}
     }
 
@@ -3621,6 +3666,8 @@ After your response, on a NEW LINE starting with "FOLLOW_UP:", suggest 2-3 brief
             const _text = `${payload.title} ${payload.category || 'task'}`.trim();
             if (_text) callPython('index', { db_dir: _vDir, doc_type: 'reminder', doc_id: `reminder-${result.lastInsertRowid}`, text: _text }).catch(() => {});
           }
+          // Invalidate cached task/reminder queries so next query reflects the new item
+          if (responseCacheService) responseCacheService.invalidateByTerms(['task', 'remind', 'due', 'todo', 'overdue', 'open task']);
           return { ok: true, text: `✅ Reminder set: "${payload.title}"` };
         }
         case 'email': {
@@ -3632,6 +3679,8 @@ After your response, on a NEW LINE starting with "FOLLOW_UP:", suggest 2-3 brief
           const urgent = result.emails?.filter(e => e.category === 'urgent').length || 0;
           // P10-5: Track time saved for email triage
           if (count > 0) trackTimeSaved('email_triage', count * 0.5, `Triaged ${count} emails`);
+          // Invalidate cached email queries so next query shows fresh inbox counts
+          if (responseCacheService) responseCacheService.invalidateByTerms(['email', 'inbox', 'urgent', 'unread', 'mail']);
           return { ok: true, text: `📬 ${count} emails fetched${urgent > 0 ? `, ${urgent} urgent` : ''}.` };
         }
         case 'send-reply': {
@@ -4926,8 +4975,8 @@ app.whenReady().then(async () => {
   calendarIntelService = require('../services/calendar-intel.js');
   financialIntel = require('../services/financial-intel.js');
   intelligenceService = require('../services/intelligence.js');
-
-  // ── Security: migrate Gmail refresh_token from plaintext DB → keytar ──
+  responseCacheService = require('../services/response-cache.js');
+  console.log('[ARIA] Response cache initialized');
   try {
     const keytar = require('keytar');
     const gmailOAuthSvc = require('../services/gmail-oauth.js');

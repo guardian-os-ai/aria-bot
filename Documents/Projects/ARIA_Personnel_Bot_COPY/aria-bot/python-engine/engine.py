@@ -58,6 +58,13 @@ def get_hybrid_retriever(db_dir):
         from rag import HybridRetriever
         store = get_vector_store(db_dir)
         _rag = HybridRetriever(store)
+        # Restore BM25 index from disk so it survives sidecar restarts
+        if db_dir:
+            import os
+            bm25_path = os.path.join(db_dir, 'bm25_index.pkl')
+            loaded = _rag.load_bm25(bm25_path)
+            if not loaded:
+                print("[Engine] No BM25 index on disk — will build on next build_bm25 call", file=__import__('sys').stderr)
     return _rag
 
 
@@ -150,9 +157,15 @@ def handle_request(req):
         return {"results": results}
 
     elif req_type == "build_bm25":
-        retriever = get_hybrid_retriever(payload.get("db_dir", ""))
+        db_dir = payload.get("db_dir", "")
+        retriever = get_hybrid_retriever(db_dir)
         documents = payload.get("documents", [])
         count = retriever.build_bm25_index(documents)
+        # Persist the built index to disk so it survives sidecar restarts
+        if db_dir and count > 0:
+            import os
+            bm25_path = os.path.join(db_dir, 'bm25_index.pkl')
+            retriever.save_bm25(bm25_path)
         return {"indexed": count}
 
     else:

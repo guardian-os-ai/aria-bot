@@ -11,8 +11,14 @@ Usage:
 
 BM25 adds keyword-exact matching that vector search sometimes misses
 (e.g., "Swiggy" as a proper noun, specific amounts, exact dates).
+
+Persistence:
+    retriever.save_bm25(path)  # pickle corpus to disk after building
+    retriever.load_bm25(path)  # restore from disk on sidecar restart
 """
 
+import os
+import pickle
 import re
 import sys
 from typing import List, Dict, Any, Optional
@@ -58,6 +64,62 @@ class HybridRetriever:
                   file=sys.stderr)
 
         return len(self._corpus_tokens)
+
+    def save_bm25(self, path: str) -> bool:
+        """
+        Persist the BM25 corpus (tokens + docs) to disk using pickle.
+        Call this after build_bm25_index() so the index survives sidecar restarts.
+
+        Args:
+            path: Absolute path to the .pkl file (e.g. <vectors_dir>/bm25_index.pkl)
+        Returns:
+            True if saved successfully, False otherwise.
+        """
+        if not self._bm25 or not self._corpus_tokens:
+            return False
+        try:
+            os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
+            with open(path, 'wb') as f:
+                pickle.dump({
+                    'corpus_tokens': self._corpus_tokens,
+                    'corpus_docs': self._corpus_docs,
+                }, f, protocol=pickle.HIGHEST_PROTOCOL)
+            print(f"[RAG] BM25 index saved: {len(self._corpus_tokens)} docs → {path}", file=sys.stderr)
+            return True
+        except Exception as e:
+            print(f"[RAG] BM25 save error: {e}", file=sys.stderr)
+            return False
+
+    def load_bm25(self, path: str) -> bool:
+        """
+        Restore BM25 corpus from disk. Rebuilds the BM25Okapi object in-memory
+        from the pickled token corpus so search is immediately available.
+
+        Args:
+            path: Absolute path to the .pkl file
+        Returns:
+            True if loaded successfully, False if file missing or corrupt.
+        """
+        if not os.path.exists(path):
+            return False
+        try:
+            from rank_bm25 import BM25Okapi
+        except ImportError:
+            print("[RAG] rank-bm25 not installed — BM25 load skipped", file=sys.stderr)
+            return False
+        try:
+            with open(path, 'rb') as f:
+                data = pickle.load(f)
+            self._corpus_tokens = data.get('corpus_tokens', [])
+            self._corpus_docs   = data.get('corpus_docs', [])
+            if self._corpus_tokens:
+                self._bm25 = BM25Okapi(self._corpus_tokens)
+                print(f"[RAG] BM25 index loaded from disk: {len(self._corpus_tokens)} docs", file=sys.stderr)
+                return True
+            return False
+        except Exception as e:
+            print(f"[RAG] BM25 load error (will rebuild): {e}", file=sys.stderr)
+            return False
 
     @staticmethod
     def _tokenize(text: str) -> List[str]:
