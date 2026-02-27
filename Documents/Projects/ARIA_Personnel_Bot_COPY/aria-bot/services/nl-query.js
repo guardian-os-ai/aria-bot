@@ -77,6 +77,50 @@ function extractQueryIntent(msg) {
   // 2+ merchants found → auto-enable comparison. Zero hardcoding.
   if (result.params.merchants.length >= 2) result.params.comparison = true;
 
+  // ── Raw "A vs B" fallback extractor ──
+  // Runs AFTER the DB-lookup loop. Catches unknown merchants/services not yet in DB.
+  // e.g. "BluSmart vs Rapido" — BluSmart has no transactions yet, so the DB loop misses it.
+  // We extract both sides of vs/or/versus and try SQL LIKE anyway.
+  // If 0 data found for a side, we say "No data for X" — never silently wrong-route.
+  // Also resolves categories: "rides vs food" → categories if both are synonyms.
+  const _vsStopWords = new Set([
+    'this', 'last', 'the', 'my', 'that', 'month', 'week', 'year', 'day',
+    'how', 'much', 'did', 'is', 'was', 'been', 'am', 'spending', 'spend',
+    'more', 'less', 'better', 'cheaper', 'expensive', 'which', 'what',
+    'than', 'total', 'cost', 'costs', 'paid', 'me', 'i', 'do', 'should'
+  ]);
+  if (/\bvs\.?\b|\bversus\b|\bagainst\b/.test(low) && result.params.merchants.length < 2) {
+    // Match: "word(s) vs word(s)" — handles multi-word like "google pay vs phonepe"
+    const rawVs = low.match(/\b([\w]+(?:\s+[\w]+)?)\s+(?:vs\.?|versus|against)\s+([\w]+(?:\s+[\w]+)?)/);
+    if (rawVs) {
+      const clean = (s) => s.split(/\s+/).filter(w => !_vsStopWords.has(w)).join(' ').trim();
+      const left  = clean(rawVs[1]);
+      const right = clean(rawVs[2]);
+      if (left && right && left !== right) {
+        // Try category resolution first — "food vs travel" → categories[]
+        const leftCat  = resolveCategory(left);
+        const rightCat = resolveCategory(right);
+        if (leftCat && rightCat && leftCat !== rightCat) {
+          if (!result.params.categories.includes(leftCat))  result.params.categories.push(leftCat);
+          if (!result.params.categories.includes(rightCat)) result.params.categories.push(rightCat);
+          if (!result.params.category) result.params.category = leftCat;
+        } else {
+          // Unknown merchants — push raw strings. handleMerchantComparison uses LIKE %X%
+          // SQL will find whatever data exists; zero data → informative "no data" message.
+          if (result.params.merchants.length === 0) {
+            result.params.merchants.push(left, right);
+            result.params.merchant = left;
+          } else if (result.params.merchants.length === 1) {
+            // One side already matched by DB; raw-extract the other side
+            const known = result.params.merchants[0];
+            const other = (known === left || left.includes(known) || known.includes(left.split(' ')[0])) ? right : left;
+            if (other && !result.params.merchants.includes(other)) result.params.merchants.push(other);
+          }
+        }
+      }
+    }
+  }
+
   // ── Extract category (DYNAMIC: with synonym resolution) ──
   // "spend on food" / "dining expenses" / "commute costs" → resolved via synonyms
   const knownCategories = getCategories(); // dynamic from DB
@@ -592,12 +636,16 @@ function handleMerchantComparison(merchants, tr) {
     lines.push(`• ${r.name}: **${fmt(r.total)}** (${r.count} transaction${r.count !== 1 ? 's' : ''})`);
   }
 
-  if (results.length >= 2 && results[0].total > 0 && results[1].total > 0) {
+  if (results.every(r => r.total === 0)) {
+    // Neither merchant has any data at all
+    lines.push(`\n⚠️ No transactions found for ${results.map(r => r.name).join(' or ')} in ${period}.`);
+    lines.push(`_ARIA learns from your bank/app emails. If you've used these services, forward a transaction email to add data._`);
+  } else if (results.length >= 2 && results[0].total > 0 && results[1].total > 0) {
     const diff = results[0].total - results[1].total;
     const pct  = Math.round((diff / results[1].total) * 100);
     lines.push(`\n→ **${results[0].name}** is ${fmt(diff)} (${pct}%) higher`);
   } else if (results[0].total > 0 && results[1]?.total === 0) {
-    lines.push(`\n→ No transactions found for ${results[1]?.name} in this period`);
+    lines.push(`\n⚠️ No transactions found for **${results[1]?.name}** in ${period} — either no data yet, or the name differs in your emails.`);
   }
 
   return { answer: lines.join('\n'), type: 'money', data: { merchants: results, period } };
@@ -639,12 +687,17 @@ function handleCategoryComparison(categories, tr) {
     const topNote = r.topMerchant ? ` (top: ${r.topMerchant})` : '';
     lines.push(`• ${r.name}: **${fmt(r.total)}** across ${r.count} txn${r.count !== 1 ? 's' : ''}${topNote}`);
   }
-  if (results.length >= 2 && results[0].total > 0 && results[1].total > 0) {
+
+  if (results.every(r => r.total === 0)) {
+    lines.push(`\n⚠️ No spending data found for ${results.map(r => r.name).join(' or ')} in ${period}.`);
+    lines.push(`_These might be new categories or named differently in your transactions._`);
+  } else if (results.length >= 2 && results[0].total > 0 && results[1].total > 0) {
     const diff = results[0].total - results[1].total;
     const pct  = Math.round((diff / results[1].total) * 100);
     lines.push(`\n→ You spend **${pct}% more** on ${results[0].name} than ${results[1].name} (${fmt(diff)} difference)`);
   } else if (results[0].total > 0) {
-    lines.push(`\n→ No data for ${results.find(r => r.total === 0)?.name} in this period`);
+    const empty = results.find(r => r.total === 0);
+    lines.push(`\n⚠️ No data for **${empty?.name}** in ${period} — either no transactions logged yet, or categorised differently.`);
   }
   return { answer: lines.join('\n'), type: 'money', data: { categories: results, period } };
 }
