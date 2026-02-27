@@ -417,6 +417,81 @@ Use these tools to create or modify items based on user requests:
 """
 
 
+# ── Live Context Builder — injected into system prompt on every agent call ────
+# This is what separates an agent from a chatbot: it knows the user's current
+# state before answering. Pure SQL, < 5ms, no LLM.
+
+def _get_live_context(db_path: str) -> str:
+    """
+    Build a compact 'user's current state' block for the system prompt.
+    Called on every agent_chat / agent_chat_stream invocation.
+    Returns empty string if DB unavailable (graceful degradation).
+    """
+    if not db_path:
+        return ""
+    try:
+        conn = sqlite3.connect(db_path, timeout=3)
+        conn.row_factory = sqlite3.Row
+        now_ts = int(datetime.datetime.now().timestamp())
+        parts  = []
+
+        # 1. Overdue tasks
+        overdue_count = (conn.execute(
+            "SELECT COUNT(*) FROM reminders WHERE completed=0 AND archived_at IS NULL AND due_at < ?",
+            (now_ts,)
+        ).fetchone() or [0])[0]
+        if overdue_count > 0:
+            parts.append(f"⚠️ {overdue_count} overdue task{'s' if overdue_count != 1 else ''}")
+
+        # 2. Imminent tasks (next 24 h)
+        imminent = conn.execute(
+            """SELECT title, due_at FROM reminders
+               WHERE completed=0 AND archived_at IS NULL AND due_at BETWEEN ? AND ?
+               ORDER BY due_at ASC LIMIT 3""",
+            (now_ts, now_ts + 86400)
+        ).fetchall()
+        if imminent:
+            task_strs = [f'"{row["title"]}" ({datetime.datetime.fromtimestamp(row["due_at"]).strftime("%b %d %H:%M")})' for row in imminent]
+            parts.append(f"Tasks due soon: {', '.join(task_strs)}")
+
+        # 3. Unread urgent emails
+        urgent_emails = (conn.execute(
+            "SELECT COUNT(*) FROM email_cache WHERE category IN ('urgent','action') AND is_read=0"
+        ).fetchone() or [0])[0]
+        if urgent_emails > 0:
+            parts.append(f"📧 {urgent_emails} unread urgent/action email{'s' if urgent_emails != 1 else ''}")
+
+        # 4. Today's calendar events
+        today_start = int(datetime.datetime.now().replace(hour=0, minute=0, second=0).timestamp())
+        today_end   = today_start + 86400
+        events = conn.execute(
+            """SELECT title, start_at FROM calendar_events
+               WHERE start_at BETWEEN ? AND ? ORDER BY start_at ASC LIMIT 3""",
+            (today_start, today_end)
+        ).fetchall()
+        if events:
+            ev_strs = [f'"{row["title"]}" at {datetime.datetime.fromtimestamp(row["start_at"]).strftime("%H:%M")}' for row in events]
+            parts.append(f"Calendar today: {', '.join(ev_strs)}")
+
+        # 5. Active goals
+        try:
+            goals = conn.execute(
+                "SELECT title, status FROM goals WHERE status='active' ORDER BY created_at DESC LIMIT 3"
+            ).fetchall()
+            if goals:
+                parts.append(f"Active goals: {', '.join(f'"{g[\"title\"]}\"' for g in goals)}")
+        except Exception:
+            pass
+
+        conn.close()
+        if not parts:
+            return ""
+        return "\n\nUSER'S CURRENT STATE (as of right now — use this context when answering):\n" + "\n".join(f"  • {p}" for p in parts) + "\n"
+
+    except Exception:
+        return ""
+
+
 # ── Tool Definitions for Ollama ───────────────────────────────────────────────
 
 TOOLS = [
@@ -1763,9 +1838,10 @@ def agent_chat(
 
     model = _select_model()
 
-    # Build messages array — inject entity memory into system prompt (Phase F)
+    # Build messages array — inject live context + entity memory into system prompt
     entity_memory = _get_entity_memory(db_path)
-    system_content = SYSTEM_PROMPT + entity_memory if entity_memory else SYSTEM_PROMPT
+    live_context  = _get_live_context(db_path)
+    system_content = SYSTEM_PROMPT + live_context + (entity_memory if entity_memory else "")
     messages = [{"role": "system", "content": system_content}]
 
     # History window: slim=2 turns; full=6 turns (was 12 — capped to reduce token waste)
@@ -1951,7 +2027,8 @@ def agent_chat_stream(
 
     model = _select_model()
     entity_memory = _get_entity_memory(db_path)
-    system_content = SYSTEM_PROMPT + entity_memory if entity_memory else SYSTEM_PROMPT
+    live_context  = _get_live_context(db_path)
+    system_content = SYSTEM_PROMPT + live_context + (entity_memory if entity_memory else "")
 
     messages = [{"role": "system", "content": system_content}]
 

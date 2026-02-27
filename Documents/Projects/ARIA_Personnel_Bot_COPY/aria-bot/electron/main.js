@@ -3016,6 +3016,113 @@ Body: ${(bodyPreview || '').substring(0, 500)}`;
   }
 
   // ── Follow-up suggestions by query type ──
+  // ── Cross-domain context builder — used by email synthesis and agent system prompt ──
+  // Pure SQL, no LLM, < 5ms. Gathers what's actually happening in the user's life.
+  // This is what makes the LLM's answer relevant instead of generic.
+  function _getLiveContext() {
+    const now = nowUnix();
+    const ctx = { urgentTasks: [], upcomingEvents: [], activeGoals: [], overdueCount: 0 };
+    try {
+      ctx.urgentTasks = all(
+        `SELECT title, due_at, category FROM reminders
+         WHERE completed=0 AND archived_at IS NULL
+           AND (due_at < ? OR priority_score >= 7 OR category='work')
+         ORDER BY due_at ASC LIMIT 3`,
+        [now + 86400]
+      );
+    } catch (_) {}
+    try {
+      ctx.overdueCount = get(
+        `SELECT COUNT(*) as cnt FROM reminders
+         WHERE completed=0 AND archived_at IS NULL AND due_at < ?`, [now]
+      )?.cnt || 0;
+    } catch (_) {}
+    try {
+      ctx.upcomingEvents = all(
+        `SELECT title, start_at, location FROM calendar_events
+         WHERE start_at BETWEEN ? AND ? ORDER BY start_at ASC LIMIT 3`,
+        [now, now + 86400]
+      );
+    } catch (_) {}
+    try {
+      if (goalsService) ctx.activeGoals = goalsService.getActiveGoals().slice(0, 3);
+    } catch (_) {}
+    return ctx;
+  }
+
+  // ── Format live context as a compact text block for LLM prompts ──
+  function _formatLiveContextForLLM(ctx) {
+    const now = nowUnix();
+    const lines = [];
+    if (ctx.overdueCount > 0)     lines.push(`Overdue tasks: ${ctx.overdueCount}`);
+    if (ctx.urgentTasks.length)   lines.push(`Urgent/upcoming tasks: ${ctx.urgentTasks.map(t => `"${t.title}" (due ${new Date(t.due_at * 1000).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })})`).join(' | ')}`);
+    if (ctx.upcomingEvents.length) lines.push(`Calendar today: ${ctx.upcomingEvents.map(e => `"${e.title}" at ${new Date(e.start_at * 1000).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })}`).join(' | ')}`);
+    if (ctx.activeGoals.length)   lines.push(`Active goals: ${ctx.activeGoals.map(g => g.title).join(' | ')}`);
+    return lines.length ? lines.join('\n') : 'No urgent tasks or upcoming events.';
+  }
+
+  // ── Cross-domain context builder — used by email synthesis and agent system prompt ──
+  // Pure SQL, no LLM, < 5ms. Gathers what's actually happening in the user's life.
+  // This is what makes the LLM's answer relevant instead of generic.
+  function _getLiveContext() {
+    const now = nowUnix();
+    const ctx = { urgentTasks: [], upcomingEvents: [], activeGoals: [], overdueCount: 0 };
+    try {
+      ctx.urgentTasks = all(
+        `SELECT title, due_at, category FROM reminders
+         WHERE completed=0 AND archived_at IS NULL
+           AND (due_at < ? OR priority_score >= 7 OR category='work')
+         ORDER BY due_at ASC LIMIT 3`,
+        [now + 86400]
+      );
+    } catch (_) {}
+    try {
+      ctx.overdueCount = get(
+        `SELECT COUNT(*) as cnt FROM reminders
+         WHERE completed=0 AND archived_at IS NULL AND due_at < ?`, [now]
+      )?.cnt || 0;
+    } catch (_) {}
+    try {
+      ctx.upcomingEvents = all(
+        `SELECT title, start_at, location FROM calendar_events
+         WHERE start_at BETWEEN ? AND ? ORDER BY start_at ASC LIMIT 3`,
+        [now, now + 86400]
+      );
+    } catch (_) {}
+    try {
+      if (goalsService) ctx.activeGoals = goalsService.getActiveGoals().slice(0, 3);
+    } catch (_) {}
+    return ctx;
+  }
+
+  // ── Format live context as a compact text block for LLM prompts ──
+  function _formatLiveContextForLLM(ctx) {
+    const lines = [];
+    if (ctx.overdueCount > 0)      lines.push(`Overdue tasks: ${ctx.overdueCount}`);
+    if (ctx.urgentTasks.length)    lines.push(`Urgent/upcoming tasks: ${ctx.urgentTasks.map(t => `"${t.title}" (due ${new Date(t.due_at * 1000).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })})`).join(' | ')}`);
+    if (ctx.upcomingEvents.length) lines.push(`Calendar today: ${ctx.upcomingEvents.map(e => `"${e.title}" at ${new Date(e.start_at * 1000).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })}`).join(' | ')}`);
+    if (ctx.activeGoals.length)    lines.push(`Active goals: ${ctx.activeGoals.map(g => g.title).join(' | ')}`);
+    return lines.length ? lines.join('\n') : 'No urgent tasks or events noted.';
+  }
+
+  // ── Compute email follow-ups from actual email content — not hardcoded ──
+  // Looks at the actual emails returned and suggests relevant next actions.
+  function _computeEmailFollowUps(emails, liveCtx) {
+    if (!emails || emails.length === 0) return ['Refresh inbox', 'Urgent emails', 'Who emails me most?'];
+    const followUps = [];
+    const hasUrgent  = emails.some(e => e.category === 'urgent');
+    const hasAction  = emails.some(e => e.category === 'action');
+    const hasUnread  = emails.some(e => !e.is_read);
+    const senders    = [...new Set(emails.map(e => e.from_name || e.from_email).filter(Boolean))];
+
+    if (hasUrgent)              followUps.push(`Reply to ${senders[0] || 'urgent email'}`);
+    if (hasAction && !hasUrgent) followUps.push('Show emails needing reply');
+    if (liveCtx.overdueCount > 0) followUps.push(`${liveCtx.overdueCount} overdue tasks — show them`);
+    if (senders.length > 0 && !hasUrgent) followUps.push(`Emails from ${senders[0]}`);
+    followUps.push('Refresh inbox');
+    return followUps.slice(0, 3);
+  }
+
   function _getFollowUps(type, message) {
     const msg = (message || '').toLowerCase();
     const KNOWN_MERCHANTS_INLINE = ['swiggy','zomato','uber','ola','amazon','flipkart','netflix','hotstar','spotify','airtel','jio','zerodha','groww','phonepe','paytm','cred','bigbasket','blinkit'];
@@ -3270,28 +3377,42 @@ Body: ${(bodyPreview || '').substring(0, 500)}`;
         if (queryResult.answer) {
           const followUps = _getFollowUps(queryResult.type, message);
 
-          // ── Email summary: nl-query returned previews + needsSummary flag ──
-          // Fire ONE targeted Ollama call to turn raw previews into a digest.
-          // Falls back to the plain preview list if aiService is unavailable.
+          // ── Email synthesis: context-aware, cross-domain intelligence ──
+          // The LLM gets: emails + user's actual live context (tasks, goals, calendar).
+          // Asks for per-email summary + action + urgency, plus a synthesis statement.
+          // Computes follow-ups from actual email content — not hardcoded strings.
+          // Cache: 90 seconds only (emails are live data, stale answers are worse than slow ones).
           if (queryResult.data?.needsSummary && aiService) {
-            console.log(`[AI] TIER-1 email summary: sending ${queryResult.data.limit} email previews to LLM`);
+            console.log(`[AI] TIER-1 email synthesis: ${queryResult.data.limit} emails + live context`);
             let aiSummary = '';
+            const liveCtx = _getLiveContext();
+            const ctxBlock = _formatLiveContextForLLM(liveCtx);
+            const emailCount = queryResult.data.emails?.length || queryResult.data.limit;
+
             try {
               aiSummary = await aiService.aiCall(
                 'chat',
                 queryResult.data.summaryPrompt,
                 {
                   systemContext:
-                    'You are summarizing emails for a busy professional. ' +
-                    'For each email give ONE bullet line: sender, subject, and what action (if any) is needed. ' +
-                    'Be extremely concise. No preamble. Format: • Sender: "Subject" — action/gist.'
+                    `You are ARIA, a sharp personal executive AI.\n` +
+                    `User's current state:\n${ctxBlock}\n\n` +
+                    `Analyze the ${emailCount} emails below with awareness of this context.\n\n` +
+                    `For EACH email output exactly:\n` +
+                    `• **[Sender]: "[Subject]"** — [one sentence: what it is + what, if anything, the user must do] — **[High/Medium/Low]**\n\n` +
+                    `After all emails, on its own line:\n` +
+                    `**→** [Single most important thing — specific, not generic. If an email connects to a task, goal, or event listed above, name it explicitly.]\n\n` +
+                    `Rules: no preamble, no filler, no "here is a summary". Start with the first bullet.`
                 }
               );
               aiSummary = (typeof aiSummary === 'string' ? aiSummary : aiSummary?.text || '').trim();
             } catch (_) { /* fallback to plain list below */ }
 
+            // Compute follow-ups from actual email content — not hardcoded
+            const computedFollowUps = _computeEmailFollowUps(queryResult.data.emails, liveCtx);
+
             const summaryText = aiSummary
-              ? `📧 **Email digest — last ${queryResult.data.limit}:**\n\n${aiSummary}`
+              ? `📧 **Emails:**\n\n${aiSummary}`
               : `📧 ${queryResult.answer}`;
 
             const summaryResult = {
@@ -3299,13 +3420,12 @@ Body: ${(bodyPreview || '').substring(0, 500)}`;
               action: 'query_answered',
               queryType: 'email',
               data: queryResult.data,
-              followUps: ['Any urgent emails?', 'Show unread', 'Refresh inbox'],
+              followUps: computedFollowUps,
               mode: mode || 'work',
-              aiProvider: 'local-query+llm-summary'
+              aiProvider: 'local-query+context-synthesis'
             };
-            // Cache for 10 min (emails don't change that fast)
-            if (responseCacheService) responseCacheService.set(message, summaryResult, 600);
-            if (memoryExtractService) memoryExtractService.saveAnswer(message, summaryResult.text, 'email-summary', 600);
+            // 90 seconds only — email state changes, stale answers are wrong answers
+            if (responseCacheService) responseCacheService.set(message, summaryResult, 90);
             return summaryResult;
           }
 
