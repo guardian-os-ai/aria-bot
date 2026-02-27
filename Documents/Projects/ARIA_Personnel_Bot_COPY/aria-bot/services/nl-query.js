@@ -50,6 +50,7 @@ function extractQueryIntent(msg) {
     action: null,     // list | summary | total | compare | last | count | search | breakdown | trend
     params: {
       merchant: null,
+      merchants: [],   // ALL matched merchants — enables Swiggy vs Zomato comparisons
       category: null,
       timeRange: null,  // { start, end } unix timestamps
       limit: null,
@@ -437,7 +438,12 @@ function handleMoney(intent) {
   const { merchant, category, limit, comparison } = params;
   const tr = params.timeRange || defaultTimeRange();
 
-  // ── Merchant-specific queries ──
+  // ── Multi-merchant comparison: "swiggy vs zomato", "am I spending more on X or Y" ──
+  if (params.merchants && params.merchants.length >= 2) {
+    return handleMerchantComparison(params.merchants, tr);
+  }
+
+  // ── Single merchant queries ──
   if (merchant) {
     return handleMerchantQuery(merchant, action, tr, limit);
   }
@@ -465,6 +471,45 @@ function handleMoney(intent) {
     default:
       return handleMoneySummary(tr);
   }
+}
+
+// ── Multi-merchant comparison sub-handler ──
+
+function handleMerchantComparison(merchants, tr) {
+  const period = timeRangeLabel(tr);
+  const results = merchants.map(m => {
+    const like = `%${m}%`;
+    const tx = get(
+      `SELECT SUM(amount) as t, COUNT(*) as c FROM transactions
+       WHERE (LOWER(merchant) LIKE ? OR LOWER(description) LIKE ?) AND timestamp BETWEEN ? AND ?`,
+      [like, like, tr.start, tr.end]
+    );
+    const sl = get(
+      `SELECT SUM(amount_raw) as t, COUNT(*) as c FROM spend_log
+       WHERE LOWER(description) LIKE ? AND occurred_at BETWEEN ? AND ?`,
+      [like, tr.start, tr.end]
+    );
+    return {
+      name: m.charAt(0).toUpperCase() + m.slice(1),
+      total: (tx?.t || 0) + (sl?.t || 0),
+      count: (tx?.c || 0) + (sl?.c || 0)
+    };
+  }).sort((a, b) => b.total - a.total);
+
+  const lines = [`**${results.map(r => r.name).join(' vs ')}** — ${period}:\n`];
+  for (const r of results) {
+    lines.push(`• ${r.name}: **${fmt(r.total)}** (${r.count} transaction${r.count !== 1 ? 's' : ''})`);
+  }
+
+  if (results.length >= 2 && results[0].total > 0 && results[1].total > 0) {
+    const diff = results[0].total - results[1].total;
+    const pct  = Math.round((diff / results[1].total) * 100);
+    lines.push(`\n→ **${results[0].name}** is ${fmt(diff)} (${pct}%) higher`);
+  } else if (results[0].total > 0 && results[1]?.total === 0) {
+    lines.push(`\n→ No transactions found for ${results[1]?.name} in this period`);
+  }
+
+  return { answer: lines.join('\n'), type: 'money', data: { merchants: results, period } };
 }
 
 // ── Merchant sub-handler ──
@@ -948,6 +993,38 @@ function parseAmount(amountStr) {
 function handleEmail(intent) {
   const { action, params } = intent;
   const low = params.raw.toLowerCase();
+
+  // ── Extract optional sender filter: "from Rahul", "from my boss", "sent by Priya" ──
+  // Parsed here once — used in the sender-specific block below.
+  const _senderMatch = low.match(/\bfrom\s+(?:my\s+)?([a-z]{2,40})\b|\bsent\s+by\s+([a-z]{2,40})\b/);
+  const _senderRaw   = (_senderMatch?.[1] || _senderMatch?.[2] || '').trim();
+  const _ignoreWords = new Set(['me','us','them','you','him','her','inbox','chat','mail','email','anyone','someone','anyone']);
+  const senderFilter = _senderRaw && !_ignoreWords.has(_senderRaw) ? `%${_senderRaw}%` : null;
+
+  // ── Sender-specific block: "emails from Rahul", "urgent emails from boss" ──
+  // Combines sender filter with optional urgency/action filter from the query.
+  if (senderFilter) {
+    const urgentOnly = /urgent|important|critical|action\s+needed/i.test(low);
+    const catClause  = urgentOnly ? `AND category IN ('urgent','action')` : '';
+    const emails = all(
+      `SELECT from_name, from_email, subject, body_preview, category, received_at FROM email_cache
+       WHERE (LOWER(from_name) LIKE ? OR LOWER(from_email) LIKE ?) ${catClause}
+       ORDER BY received_at DESC LIMIT ?`,
+      [senderFilter, senderFilter, params.limit || 10]
+    );
+    if (emails.length === 0) {
+      const who = _senderRaw.charAt(0).toUpperCase() + _senderRaw.slice(1);
+      return { answer: `No ${urgentOnly ? 'urgent ' : ''}emails from ${who} in your cached inbox.`, type: 'email' };
+    }
+    const displayName = emails[0].from_name || (_senderRaw.charAt(0).toUpperCase() + _senderRaw.slice(1));
+    let lines = [`**${urgentOnly ? 'Urgent emails' : 'Emails'} from ${displayName}** (${emails.length}):\n`];
+    for (const e of emails) {
+      const flag    = e.category === 'urgent' ? '\ud83d\udd34 ' : e.category === 'action' ? '\ud83d\udfe1 ' : '';
+      const preview = e.body_preview ? ` \u2014 ${e.body_preview.substring(0, 80).trim()}...` : '';
+      lines.push(`\u2022 ${flag}"${e.subject}" \u2014 ${fmtDateShort(e.received_at)}${preview}`);
+    }
+    return { answer: lines.join('\n'), type: 'email', data: { emails, sender: _senderRaw } };
+  }
 
   // "who emails me the most" / "top senders"
   if (/who\s+(?:email|send|mail)|top\s+sender|most\s+(?:email|mail)/.test(low)) {

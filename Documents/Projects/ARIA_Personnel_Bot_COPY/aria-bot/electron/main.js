@@ -78,7 +78,7 @@ function createFallbackIcon() {
 }
 
 // Services — imported after DB init
-let aiService, gmailService, calendarService, remindService, briefingService, weatherService, habitsService, focusService, weeklyReportService, nlQueryService, analyticsService, calendarIntelService, financialIntel, intelligenceService, responseCacheService, memoryExtractService;
+let aiService, gmailService, calendarService, remindService, briefingService, weatherService, habitsService, focusService, weeklyReportService, nlQueryService, analyticsService, calendarIntelService, financialIntel, intelligenceService, responseCacheService, memoryExtractService, automationRulesService;
 
 // ── Python Sidecar (P2-1) — with auto-restart, heartbeat, and delta streaming ─────────────────────────────────────────────────
 // Spawns python-engine/engine.py as a child process.
@@ -3665,8 +3665,21 @@ After your response, on a NEW LINE starting with "FOLLOW_UP:", suggest 2-3 brief
   }
 
   ipcMain.handle('chat-enhanced', async (_event, message, mode) => {
+    const _t0 = Date.now();
     try {
-      return await chatEnhancedHandler(message, mode);
+      const _resp = await chatEnhancedHandler(message, mode);
+      // Non-blocking route signal: log every query → tier → latency for routing intelligence
+      setImmediate(() => {
+        try {
+          const _norm = (message || '').toLowerCase().trim()
+            .replace(/[^a-z0-9\s\u20b9]/g, '').replace(/\s+/g, ' ').substring(0, 200);
+          run(
+            `INSERT INTO route_signals (query_norm, tier, latency_ms, had_answer, created_at) VALUES (?, ?, ?, ?, ?)`,
+            [_norm, _resp?.aiProvider || 'unknown', Date.now() - _t0, _resp?.text ? 1 : 0, Math.floor(Date.now() / 1000)]
+          );
+        } catch (_) {}
+      });
+      return _resp;
     } catch (err) {
       console.error('[IPC] chat-enhanced error:', err);
       return { text: `Sorry, something went wrong: ${err.message}`, followUps: [], mode: mode || 'work' };
@@ -3858,6 +3871,37 @@ After your response, on a NEW LINE starting with "FOLLOW_UP:", suggest 2-3 brief
     } catch (err) {
       return { ok: false, error: err.message };
     }
+  });
+
+  // ── Automation Rules: IPC handlers ──
+  ipcMain.handle('get-automation-rules', async () => {
+    try { return automationRulesService ? automationRulesService.getRules() : []; }
+    catch (err) { return []; }
+  });
+
+  ipcMain.handle('create-automation-rule', async (_event, rule) => {
+    try { return automationRulesService ? automationRulesService.createRule(rule) : null; }
+    catch (err) { return { error: err.message }; }
+  });
+
+  ipcMain.handle('update-automation-rule', async (_event, id, fields) => {
+    try { return automationRulesService ? automationRulesService.updateRule(id, fields) : false; }
+    catch (err) { return false; }
+  });
+
+  ipcMain.handle('toggle-automation-rule', async (_event, id, enabled) => {
+    try { if (automationRulesService) automationRulesService.toggleRule(id, enabled); return { ok: true }; }
+    catch (err) { return { ok: false }; }
+  });
+
+  ipcMain.handle('delete-automation-rule', async (_event, id) => {
+    try { if (automationRulesService) automationRulesService.deleteRule(id); return { ok: true }; }
+    catch (err) { return { ok: false }; }
+  });
+
+  ipcMain.handle('get-route-stats', async (_event, days) => {
+    try { return automationRulesService ? automationRulesService.getRouteStats(days || 7) : {}; }
+    catch (err) { return {}; }
   });
 
   // ══════════════════════════════════════════════════════════════════════
@@ -4946,10 +4990,22 @@ async function runBackgroundSync() {
         const lastSnapshot = getSetting('last_outcome_snapshot');
         const today = new Date().toISOString().split('T')[0];
         if (lastSnapshot !== today) {
-          // snapshotWeeklyOutcome is in IPC handler scope — we track via setting
           saveSetting('last_outcome_snapshot', today);
         }
       }
+    } catch (_) {}
+
+    // 7. Automation rules — evaluate all triggers (Zapier replacement)
+    try {
+      if (automationRulesService) await automationRulesService.evaluate();
+    } catch (err) {
+      console.warn('[AutoSync] automation rules error:', err.message);
+    }
+
+    // 8. Prune old route signals (keep last 30 days only)
+    try {
+      const pruneThreshold = Math.floor(Date.now() / 1000) - 30 * 86400;
+      run(`DELETE FROM route_signals WHERE created_at < ?`, [pruneThreshold]);
     } catch (_) {}
 
   } catch (err) {
@@ -5089,6 +5145,17 @@ app.whenReady().then(async () => {
   memoryExtractService = require('../services/memory-extract.js');
   memoryExtractService.init(require('../db/index.js'));
   console.log('[ARIA] Memory extract service initialized');
+  automationRulesService = require('../services/automation-rules.js');
+  automationRulesService.init(
+    require('../db/index.js'),
+    ({ type, title, message, severity, ruleId }) => {
+      // Push automation notification to renderer (chat panel + tray badge)
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('automation-notification', { type, title, message, severity, ruleId });
+      }
+    }
+  );
+  console.log('[ARIA] Automation rule engine initialized');
   try {
     const keytar = require('keytar');
     const gmailOAuthSvc = require('../services/gmail-oauth.js');

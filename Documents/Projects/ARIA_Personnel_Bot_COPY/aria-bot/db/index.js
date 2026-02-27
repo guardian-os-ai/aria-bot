@@ -435,6 +435,41 @@ function initDatabase() {
     )`,
     `CREATE INDEX IF NOT EXISTS idx_qa_norm ON query_answers(query_norm)`,
     `CREATE INDEX IF NOT EXISTS idx_qa_source ON query_answers(source)`,
+
+    // ── Automation rules — trigger-action engine (local Zapier replacement) ────────
+    // trigger_type: spend_over | category_spike | email_from | subscription_renewing
+    //               reminder_overdue | habit_streak_broken
+    // action_type:  notify | create_reminder | flag_email
+    `CREATE TABLE IF NOT EXISTS automation_rules (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      name          TEXT NOT NULL,
+      trigger_type  TEXT NOT NULL,
+      trigger_params TEXT DEFAULT '{}',
+      action_type   TEXT NOT NULL,
+      action_params  TEXT DEFAULT '{}',
+      cooldown_mins INTEGER DEFAULT 60,
+      enabled       INTEGER DEFAULT 1,
+      last_fired_at INTEGER,
+      fire_count    INTEGER DEFAULT 0,
+      created_at    INTEGER DEFAULT (strftime('%s','now'))
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_ar_enabled ON automation_rules(enabled)`,
+    `CREATE INDEX IF NOT EXISTS idx_ar_trigger ON automation_rules(trigger_type)`,
+
+    // ── Route signals — query routing history. Powers learn-over-time routing. ───
+    // Every chat query is logged with which tier handled it + latency.
+    // getRouteStats() surfaces agent queries that could be promoted to SQL.
+    `CREATE TABLE IF NOT EXISTS route_signals (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      query_norm TEXT NOT NULL,
+      tier       TEXT NOT NULL,
+      latency_ms INTEGER DEFAULT 0,
+      had_answer INTEGER DEFAULT 1,
+      created_at INTEGER DEFAULT (strftime('%s','now'))
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_rs_query ON route_signals(query_norm)`,
+    `CREATE INDEX IF NOT EXISTS idx_rs_tier  ON route_signals(tier)`,
+    `CREATE INDEX IF NOT EXISTS idx_rs_time  ON route_signals(created_at)`,
   ];
   for (const migration of migrations) {
     try { db.exec(migration); } catch (e) { /* column already exists — ignore */ }

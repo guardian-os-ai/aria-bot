@@ -50,7 +50,8 @@ const FACT_PATTERNS = [
 
   // ── Employer / Role ─────────────────────────────────────────────────────
   {
-    re: /\bi\s+work\s+(?:at|for|in)\s+([A-Za-z0-9 &.',-]{2,50}?)(?:\s*[,;.]|$)/i,
+    // Stops at 'as/in/with/and' so 'I work at Google as a PM in Bangalore' → 'Google'
+    re: /\bi\s+work\s+(?:at|for|in)\s+([A-Za-z0-9 &.',-]{2,50}?)(?:\s+(?:as|in|with|and)\b|\s*[,;.]|$)/i,
     tpl: 'User works at: $1', category: 'auto-employer',
   },
   {
@@ -58,7 +59,8 @@ const FACT_PATTERNS = [
     tpl: 'User company: $1', category: 'auto-employer',
   },
   {
-    re: /\bi(?:'m|\s+am)\s+(?:a\s+|an\s+)?(?:senior\s+|lead\s+|junior\s+|chief\s+)?([A-Za-z ]{3,30}?)\s+at\s+([A-Za-z0-9 &.',-]{2,50})/i,
+    // Second capture stops at 'in/as/and' so 'I am a PM at Google in Bangalore' → 'Google'
+    re: /\bi(?:'m|\s+am)\s+(?:a\s+|an\s+)?(?:senior\s+|lead\s+|junior\s+|chief\s+)?([A-Za-z ]{3,30}?)\s+at\s+([A-Za-z0-9 &.',-]{2,50}?)(?:\s+(?:in|as|and)\b|\s*[,;.]|$)/i,
     tpl: 'User is $1 at $2', category: 'auto-employer',
   },
 
