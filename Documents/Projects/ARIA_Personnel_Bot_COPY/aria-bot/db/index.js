@@ -473,6 +473,39 @@ function initDatabase() {
     `CREATE INDEX IF NOT EXISTS idx_rs_query ON route_signals(query_norm)`,
     `CREATE INDEX IF NOT EXISTS idx_rs_tier  ON route_signals(tier)`,
     `CREATE INDEX IF NOT EXISTS idx_rs_time  ON route_signals(created_at)`,
+
+    // ── Goal Layer — tracks user spending goals across periods ──
+    `CREATE TABLE IF NOT EXISTS goals (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      title           TEXT NOT NULL,
+      goal_type       TEXT NOT NULL,
+      category        TEXT,
+      merchant        TEXT,
+      target_amount   REAL,
+      target_pct      REAL,
+      baseline_amount REAL,
+      period          TEXT DEFAULT 'month',
+      deadline        INTEGER,
+      status          TEXT DEFAULT 'active',
+      last_checked    INTEGER,
+      last_alert      INTEGER,
+      created_at      INTEGER DEFAULT (strftime('%s','now'))
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_goals_status   ON goals(status)`,
+    `CREATE INDEX IF NOT EXISTS idx_goals_category ON goals(category)`,
+    `CREATE INDEX IF NOT EXISTS idx_goals_merchant ON goals(merchant)`,
+    `CREATE TABLE IF NOT EXISTS goal_progress (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      goal_id         INTEGER REFERENCES goals(id) ON DELETE CASCADE,
+      checked_at      INTEGER NOT NULL,
+      current_amount  REAL DEFAULT 0,
+      target_amount   REAL,
+      pct_used        REAL,
+      pct_elapsed     REAL,
+      status          TEXT DEFAULT 'on_track',
+      note            TEXT
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_goal_progress ON goal_progress(goal_id, checked_at)`,
   ];
   for (const migration of migrations) {
     try { db.exec(migration); } catch (e) { /* column already exists — ignore */ }

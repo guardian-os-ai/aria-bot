@@ -78,7 +78,7 @@ function createFallbackIcon() {
 }
 
 // Services — imported after DB init
-let aiService, gmailService, calendarService, remindService, briefingService, weatherService, habitsService, focusService, weeklyReportService, nlQueryService, analyticsService, calendarIntelService, financialIntel, intelligenceService, responseCacheService, memoryExtractService, automationRulesService;
+let aiService, gmailService, calendarService, remindService, briefingService, weatherService, habitsService, focusService, weeklyReportService, nlQueryService, analyticsService, calendarIntelService, financialIntel, intelligenceService, responseCacheService, memoryExtractService, automationRulesService, goalsService;
 
 // ── Python Sidecar (P2-1) — with auto-restart, heartbeat, and delta streaming ─────────────────────────────────────────────────
 // Spawns python-engine/engine.py as a child process.
@@ -3108,9 +3108,13 @@ Body: ${(bodyPreview || '').substring(0, 500)}`;
         }
       } catch (_) {}
 
+      // Active goals summary — the agent tracking what the user cares about
+      let goalsBlock = '';
+      try { if (goalsService) goalsBlock = goalsService.getGoalSummaryForGreeting(); } catch (_) {}
+
       console.log(`[AI] FAST PATH greeting — skipped LLM entirely`);
       return {
-        text: `${timeGreet}${name}. ${statusLine}${proactiveBlock}`,
+        text: `${timeGreet}${name}. ${statusLine}${proactiveBlock}${goalsBlock}`,
         followUps: overdueCount > 0 ? ['Show overdue tasks', 'Plan my day'] : urgentEmails > 0 ? ['Summarize emails', 'Plan my day'] : ['Plan my day', 'What\'s new?'],
         mode: mode || 'work',
         aiProvider: 'fast-path'
@@ -3159,6 +3163,48 @@ Body: ${(bodyPreview || '').substring(0, 500)}`;
         console.log(`[ContextMemory] Tracked context thread: "${ctxResult.topic}" (${ctxResult.entities.length} entities)`);
       }
     } catch (_) {}
+
+    // ── TIER-0g: Goal declaration detection — regex fast path, Ollama fallback ──
+    // Fires before ANY cache or data query tier so "I want to cut food by 30%"
+    // gets a CREATE response instead of being treated as a data query.
+    if (goalsService) {
+      const goalDetect = goalsService.detectGoalFromMessage(message);
+      if (goalDetect) {
+        if (goalDetect.confidence === 'high') {
+          // Regex was confident — create goal immediately, zero LLM
+          const created = goalsService.createGoal(goalDetect);
+          const progress = goalsService.checkGoalProgress(created);
+          const confirmText = goalsService.formatNewGoalConfirmation(created, progress);
+          console.log(`[AI] TIER-0g goal created (regex) — skipped LLM: "${created.title}"`);
+          return {
+            text: confirmText,
+            action: 'goal_created',
+            data: { goal: created },
+            followUps: ['Show my goals', 'How am I tracking?', 'What\'s my current progress?'],
+            mode: mode || 'work',
+            aiProvider: 'goal-regex'
+          };
+        } else if (goalDetect.confidence === 'low') {
+          // Ambiguous — one Ollama call to extract structure
+          const interpreted = await goalsService.interpretGoalWithOllama(message);
+          if (interpreted) {
+            const created = goalsService.createGoal(interpreted);
+            const progress = goalsService.checkGoalProgress(created);
+            const confirmText = goalsService.formatNewGoalConfirmation(created, progress);
+            console.log(`[AI] TIER-0g goal created (ollama) — 1 LLM call: "${created.title}"`);
+            return {
+              text: confirmText,
+              action: 'goal_created',
+              data: { goal: created },
+              followUps: ['Show my goals', 'How am I doing?', 'Set another goal'],
+              mode: mode || 'work',
+              aiProvider: 'goal-ollama'
+            };
+          }
+          // Ollama couldn't extract a goal either — fall through to normal routing
+        }
+      }
+    }
 
     // ── QUICK ACTION DETECTION: email refresh, weather, reply, simple reminders ──
     // Short/simple structured commands use regex fast-path (instant).
@@ -5029,7 +5075,24 @@ async function runBackgroundSync() {
       console.warn('[AutoSync] automation rules error:', err.message);
     }
 
-    // 8. Prune old route signals (keep last 30 days only)
+    // 8. Goal progress check — runs silently, sends proactive alerts if any goal is at risk
+    try {
+      if (goalsService) {
+        const goalAlerts = await goalsService.checkAllGoals(
+          aiService ? aiService.aiCall.bind(aiService) : null
+        );
+        if (goalAlerts.length > 0 && mainWindow && !mainWindow.isDestroyed()) {
+          for (const alert of goalAlerts) {
+            mainWindow.webContents.send('proactive-message', { text: alert, type: 'goal-alert' });
+          }
+          console.log(`[AutoSync] Goal alerts sent: ${goalAlerts.length}`);
+        }
+      }
+    } catch (err) {
+      console.warn('[AutoSync] goal check error:', err.message);
+    }
+
+    // 9. Prune old route signals (keep last 30 days only)
     try {
       const pruneThreshold = Math.floor(Date.now() / 1000) - 30 * 86400;
       run(`DELETE FROM route_signals WHERE created_at < ?`, [pruneThreshold]);
@@ -5183,6 +5246,8 @@ app.whenReady().then(async () => {
     }
   );
   console.log('[ARIA] Automation rule engine initialized');
+  goalsService = require('../services/goals.js');
+  console.log('[ARIA] Goal layer initialized');
   try {
     const keytar = require('keytar');
     const gmailOAuthSvc = require('../services/gmail-oauth.js');

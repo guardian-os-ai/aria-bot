@@ -338,3 +338,42 @@ CREATE TABLE IF NOT EXISTS outcome_snapshots (
   created_at      INTEGER DEFAULT (strftime('%s','now')),
   UNIQUE(week_start)
 );
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- Goal Layer — what makes ARIA an agent, not a bot
+-- User declares a goal: "reduce food by 30%" → ARIA tracks, alerts, learns
+-- ═══════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS goals (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  title           TEXT NOT NULL,              -- human label: "Reduce food by 30% this month"
+  goal_type       TEXT NOT NULL,              -- 'reduce'|'limit'|'save'
+  category        TEXT,                       -- 'food'|'travel'|null
+  merchant        TEXT,                       -- 'swiggy'|null
+  target_amount   REAL,                       -- absolute target (e.g. ₹5,740)
+  target_pct      REAL,                       -- percentage reduction (e.g. 30)
+  baseline_amount REAL,                       -- 3-month avg at time goal was set
+  period          TEXT DEFAULT 'month',       -- 'week'|'month'
+  deadline        INTEGER,                    -- unix ts: end of period
+  status          TEXT DEFAULT 'active',      -- 'active'|'achieved'|'failed'|'paused'
+  last_checked    INTEGER,                    -- last background check ts
+  last_alert      INTEGER,                    -- last proactive alert ts (rate limiting)
+  created_at      INTEGER DEFAULT (strftime('%s','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_goals_status   ON goals(status);
+CREATE INDEX IF NOT EXISTS idx_goals_category ON goals(category);
+CREATE INDEX IF NOT EXISTS idx_goals_merchant ON goals(merchant);
+
+-- Continuous progress log — one row per background-sync check per goal
+CREATE TABLE IF NOT EXISTS goal_progress (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  goal_id         INTEGER REFERENCES goals(id) ON DELETE CASCADE,
+  checked_at      INTEGER NOT NULL,
+  current_amount  REAL DEFAULT 0,
+  target_amount   REAL,
+  pct_used        REAL,                       -- current/target * 100
+  pct_elapsed     REAL,                       -- how far into the period
+  status          TEXT DEFAULT 'on_track',    -- 'on_track'|'at_risk'|'exceeded'|'achieved'|'failed'
+  note            TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_goal_progress ON goal_progress(goal_id, checked_at);

@@ -579,6 +579,18 @@ TOOLS = [
                 "required": ["name", "trigger_type", "trigger_params", "action_type", "action_params"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_active_goals",
+            "description": "Get the user's active spending goals with their current progress. Use when asked 'how am I doing on my goals?', 'am I on track?', 'show my goals', 'am I meeting my budget targets?', 'how much of my food budget is left?'. Returns each goal with: title, target, amount spent so far, % used, % of period elapsed, and status (on_track/at_risk/exceeded).",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
     }
 ]
 
@@ -598,6 +610,7 @@ _ALLOWED_TABLES = {
     'budget_limits', 'chat_messages', 'context_threads', 'context_entities', 'ai_memory',
     'task_timeline', 'signal_log', 'task_time_data', 'relationship_contacts',
     'relationship_interactions', 'context_links', 'outcome_log',
+    'goals', 'goal_progress',
 }
 
 # Tokens that must never appear in LLM-generated SQL
@@ -788,6 +801,102 @@ def _create_automation_rule(name: str, trigger_type: str, trigger_params: str,
         return {"error": str(e)}
 
 
+def _get_active_goals(db_path: str = "") -> Dict[str, Any]:
+    """
+    Fetch all active goals with their current progress.
+    Progress is computed via SQL only — no LLM needed.
+    """
+    if not db_path:
+        db_path = _get_db_path()
+    try:
+        conn = sqlite3.connect(db_path, timeout=5)
+        conn.row_factory = sqlite3.Row
+        now_ts = int(datetime.datetime.now().timestamp())
+
+        goals = conn.execute(
+            "SELECT * FROM goals WHERE status='active' AND (deadline IS NULL OR deadline>?) ORDER BY created_at DESC",
+            (now_ts,)
+        ).fetchall()
+
+        if not goals:
+            conn.close()
+            return {"goals": [], "message": "No active goals set. You can set one by saying 'reduce food spend by 30% this month' or 'budget 5000 for Swiggy'."}
+
+        result = []
+        for g in goals:
+            goal = dict(g)
+            # Compute period range
+            period = goal.get('period', 'month')
+            now_dt = datetime.datetime.now()
+            if period == 'week':
+                weekday = now_dt.weekday()  # Mon=0
+                start_dt = now_dt - datetime.timedelta(days=weekday)
+                start_dt = start_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+                end_dt   = start_dt + datetime.timedelta(days=7)
+            else:  # month
+                start_dt = now_dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+                if now_dt.month == 12:
+                    end_dt = start_dt.replace(year=now_dt.year + 1, month=1)
+                else:
+                    end_dt = start_dt.replace(month=now_dt.month + 1)
+
+            start_ts = int(start_dt.timestamp())
+            end_ts   = int(end_dt.timestamp())
+            total_secs   = end_ts - start_ts
+            elapsed_secs = max(0, now_ts - start_ts)
+            pct_elapsed  = round(elapsed_secs / total_secs * 100) if total_secs > 0 else 0
+
+            # Current spend in period
+            current = 0
+            if goal.get('merchant'):
+                like = f"%{goal['merchant'].lower()}%"
+                row = conn.execute(
+                    "SELECT COALESCE(SUM(amount),0) as t FROM transactions WHERE (LOWER(merchant) LIKE ? OR LOWER(description) LIKE ?) AND timestamp BETWEEN ? AND ?",
+                    (like, like, start_ts, now_ts)
+                ).fetchone()
+                current += row['t'] if row else 0
+            elif goal.get('category'):
+                row = conn.execute(
+                    "SELECT COALESCE(SUM(amount),0) as t FROM transactions WHERE LOWER(category)=? AND timestamp BETWEEN ? AND ?",
+                    (goal['category'].lower(), start_ts, now_ts)
+                ).fetchone()
+                current += row['t'] if row else 0
+            else:
+                row = conn.execute(
+                    "SELECT COALESCE(SUM(amount),0) as t FROM transactions WHERE timestamp BETWEEN ? AND ?",
+                    (start_ts, now_ts)
+                ).fetchone()
+                current += row['t'] if row else 0
+
+            target     = goal.get('target_amount') or 1
+            pct_used   = round(current / target * 100)
+            status = 'on_track'
+            if current >= target:
+                status = 'exceeded'
+            elif pct_used > pct_elapsed + 20:
+                status = 'at_risk'
+
+            result.append({
+                'title':       goal['title'],
+                'goal_type':   goal['goal_type'],
+                'category':    goal.get('category'),
+                'merchant':    goal.get('merchant'),
+                'target':      round(target, 2),
+                'current':     round(current, 2),
+                'baseline':    goal.get('baseline_amount', 0),
+                'pct_used':    pct_used,
+                'pct_elapsed': pct_elapsed,
+                'status':      status,
+                'period':      period,
+                'deadline':    goal.get('deadline'),
+            })
+
+        conn.close()
+        return {'goals': result, 'total': len(result)}
+    except Exception as e:
+        return {'error': str(e)}
+
+
 # ── Tool Execution ────────────────────────────────────────────────────────────
 
 # Isolated thread pool — tool calls run here so they can be timed out
@@ -867,6 +976,9 @@ def _execute_tool_inner(name: str, arguments: Dict[str, Any],
                 cooldown_mins=int(arguments.get("cooldown_mins", 60)),
                 db_path=db_path,
             )
+
+        elif name == "get_active_goals":
+            result = _get_active_goals(db_path=db_path)
 
         else:
             result = {"error": f"Unknown tool: {name}"}

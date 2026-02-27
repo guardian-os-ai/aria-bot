@@ -336,6 +336,18 @@ function _analyzeCategory(category, data, tr) {
     }
   }
 
+  // 5. Active goal check — show progress toward any goal on this category
+  try {
+    const goalsService = require('./goals');
+    const goal = goalsService.getGoalForCategory(category);
+    if (goal) {
+      const p = goalsService.checkGoalProgress(goal);
+      const dot = p.status === 'on_track' ? '🟢' : p.status === 'at_risk' ? '🟡' : '🔴';
+      const rem = 100 - p.pctElapsed;
+      lines.push(`${dot} **Goal:** ${goal.title} — ${fmt(p.current)} of ${fmt(p.target)} (${p.pctUsed}% used, ${rem}% of ${goal.period} left)`);
+    }
+  } catch (_) {}
+
   return lines;
 }
 
@@ -380,6 +392,17 @@ function _analyzeMerchant(merchant, data, tr) {
     if (timing.hourLabel) timeLine += ` around **${timing.hourLabel}**`;
     lines.push(timeLine);
   }
+
+  // 4. Active goal check for this merchant
+  try {
+    const goalsService = require('./goals');
+    const goal = goalsService.getGoalForMerchant(merchant);
+    if (goal) {
+      const p = goalsService.checkGoalProgress(goal);
+      const dot = p.status === 'on_track' ? '🟢' : p.status === 'at_risk' ? '🟡' : '🔴';
+      lines.push(`${dot} **Goal:** ${goal.title} — ${fmt(p.current)} of ${fmt(p.target)} (${p.pctUsed}% used)`);
+    }
+  } catch (_) {}
 
   return lines;
 }
