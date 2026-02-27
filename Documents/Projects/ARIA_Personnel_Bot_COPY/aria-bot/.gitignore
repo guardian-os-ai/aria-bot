@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+python-engine/__pycache__/
+
+# Build output
+dist/
+dist-electron/
+
+# Environment secrets
+.env
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Models (large files)
+*.gguf
+
+# IDE
+.vscode/
+.idea/

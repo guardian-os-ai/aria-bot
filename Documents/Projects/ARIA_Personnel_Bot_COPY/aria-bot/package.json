@@ -1,0 +1,88 @@
+{
+  "name": "aria-bot",
+  "version": "0.1.0",
+  "description": "Personal AI bot overlay for Windows",
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "dev": "cross-env ELECTRON_ENTRY=electron/main.js electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "package": "electron-vite build && electron-builder"
+  },
+  "build": {
+    "appId": "com.aria.personalbot",
+    "productName": "ARIA",
+    "copyright": "Copyright © 2026",
+    "directories": {
+      "buildResources": "assets",
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*",
+      "db/**/*",
+      "services/**/*",
+      "electron/**/*",
+      "!**/*.map",
+      "!**/node_modules/.cache/**",
+      "!python-engine/**"
+    ],
+    "extraResources": [
+      {
+        "from": "python-engine",
+        "to": "python-engine",
+        "filter": ["**/*", "!__pycache__/**", "!*.pyc"]
+      }
+    ],
+    "win": {
+      "target": [{ "target": "nsis", "arch": ["x64"] }],
+      "icon": "assets/icon.ico",
+      "requestedExecutionLevel": "asInvoker"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "installerIcon": "assets/icon.ico",
+      "uninstallerIcon": "assets/icon.ico",
+      "installerHeaderIcon": "assets/icon.ico",
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "ARIA"
+    },
+    "mac": {
+      "target": "dmg",
+      "icon": "assets/icon.icns"
+    },
+    "linux": {
+      "target": "AppImage",
+      "icon": "assets/icon.png"
+    }
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.36.0",
+    "axios": "^1.6.0",
+    "better-sqlite3": "^9.4.0",
+    "imap": "^0.8.19",
+    "keytar": "^7.9.0",
+    "lucide-react": "^0.263.1",
+    "mailparser": "^3.6.5",
+    "node-ical": "^0.18.0",
+    "node-notifier": "^10.0.1",
+    "node-schedule": "^2.1.1",
+    "ollama": "^0.5.0",
+    "openai": "^6.22.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.2.1",
+    "autoprefixer": "^10.4.17",
+    "cross-env": "^10.1.0",
+    "electron": "^28.2.0",
+    "electron-builder": "^24.9.1",
+    "electron-vite": "^2.0.0",
+    "postcss": "^8.4.35",
+    "tailwindcss": "^3.4.1",
+    "vite": "^5.0.12"
+  }
+}
